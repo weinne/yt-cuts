@@ -491,6 +491,11 @@ def main():
                     print("⚠️ Gere o vídeo (opção 2) primeiro!")
                     continue
                 
+                # Garante que o usuário está logado e a sessão existe
+                if not get_insta_client():
+                    print("⚠️ Falha ao autenticar no Instagram. O post não foi agendado.")
+                    continue
+
                 desc_file = short_dir / "description.txt"
                 if desc_file.exists():
                     with open(desc_file, "r", encoding="utf-8") as f:
