@@ -1,0 +1,10 @@
+venv/
+outputs/
+insta_queue/
+insta_session.json
+*.vtt
+*.mp4
+*.srt
+*.jpg
+__pycache__/
+.DS_Store
