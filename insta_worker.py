@@ -59,7 +59,10 @@ def process_queue():
                 media = cl.clip_upload(
                     post_data["video"],
                     caption=post_data["caption"],
-                    thumbnail=post_data["thumbnail"]
+                    thumbnail=post_data["thumbnail"],
+                    extra_data={
+                        "collaborators": post_data.get("collaborators", [])
+                    }
                 )
                 print(f"✅ Upload concluído! Media ID: {media.pk}")
                 post_file.unlink() # Remove da fila

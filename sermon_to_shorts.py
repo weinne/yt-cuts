@@ -250,7 +250,7 @@ def get_insta_client():
     cl.dump_settings(session_file)
     return cl
 
-def schedule_instagram_post(video_path, caption, thumbnail_path, schedule_time_str):
+def schedule_instagram_post(video_path, caption, thumbnail_path, schedule_time_str, collaborators=None):
     queue_dir = Path("insta_queue")
     queue_dir.mkdir(exist_ok=True)
     
@@ -259,13 +259,16 @@ def schedule_instagram_post(video_path, caption, thumbnail_path, schedule_time_s
         "video": str(video_path.absolute()),
         "caption": caption,
         "thumbnail": str(thumbnail_path.absolute()) if thumbnail_path else None,
-        "scheduled_for": schedule_time_str
+        "scheduled_for": schedule_time_str,
+        "collaborators": collaborators or []
     }
     
     with open(queue_dir / f"{post_id}.json", "w", encoding="utf-8") as f:
         json.dump(post_data, f, indent=4)
     
     print(f"\n✅ Post agendado para {schedule_time_str}!")
+    if collaborators:
+        print(f"👥 {len(collaborators)} colaborador(es) adicionado(s).")
     print(f"Dados salvos em: {queue_dir / f'{post_id}.json'}")
 
 def get_video_id(url):
@@ -492,7 +495,8 @@ def main():
                     continue
                 
                 # Garante que o usuário está logado e a sessão existe
-                if not get_insta_client():
+                cl = get_insta_client()
+                if not cl:
                     print("⚠️ Falha ao autenticar no Instagram. O post não foi agendado.")
                     continue
 
@@ -501,7 +505,30 @@ def main():
                     with open(desc_file, "r", encoding="utf-8") as f:
                         caption = f.read()
                 else:
-                    caption = input("Legenda do post: ")
+                    caption = "Sermão impactante! #fé #igreja"
+
+                print(f"\n--- Legenda Atual ---\n{caption}\n--------------------")
+                edit_caption = input("Deseja editar a legenda? (s/n): ")
+                if edit_caption.lower() == 's':
+                    temp_desc = short_dir / "temp_desc.txt"
+                    with open(temp_desc, "w", encoding="utf-8") as f:
+                        f.write(caption)
+                    subprocess.run(["micro" if subprocess.run(["which", "micro"], capture_output=True).returncode == 0 else "vim", str(temp_desc)])
+                    with open(temp_desc, "r", encoding="utf-8") as f:
+                        caption = f.read()
+                    temp_desc.unlink()
+
+                collaborators = []
+                add_collab = input("Deseja adicionar colaboradores? (Usernames separados por vírgula ou Enter p/ pular): ")
+                if add_collab.strip():
+                    collab_list = [c.strip() for c in add_collab.split(",")]
+                    for username in collab_list:
+                        try:
+                            uid = cl.user_id_from_username(username)
+                            collaborators.append(uid)
+                            print(f"✅ Colaborador encontrado: {username} (ID: {uid})")
+                        except:
+                            print(f"❌ Usuário não encontrado: {username}")
                 
                 thumbnail_file = short_dir / "thumbnail.jpg"
                 if not thumbnail_file.exists():
@@ -531,7 +558,7 @@ def main():
                         print("Formato inválido.")
                         continue
                 
-                schedule_instagram_post(final_video, caption, thumbnail_file, sched_time.strftime("%Y-%m-%d %H:%M"))
+                schedule_instagram_post(final_video, caption, thumbnail_file, sched_time.strftime("%Y-%m-%d %H:%M"), collaborators)
 
             elif sub_choice == '6':
                 break
