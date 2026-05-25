@@ -17,12 +17,24 @@ def run_command(command, shell=False, check=True, input_text=None, silent=True):
     return result
 
 def run_spin_command(command, title="Processando...", silent=True, input_text=None):
-    """Executa um comando exibindo um spinner do gum."""
+    """Executa um comando exibindo um spinner do gum no stderr e capturando stdout."""
     gum_cmd = ["gum", "spin", "--spinner", "dot", "--title", title, "--"] + command
-    result = subprocess.run(gum_cmd, capture_output=True, text=True, input=input_text)
-    if result.returncode != 0 and not silent:
-        print(f"Erro em '{title}': {result.stderr}")
-    return result
+    try:
+        # Usamos stderr=sys.stderr para que o spinner seja visível no terminal
+        # E stdout=subprocess.PIPE para capturar o resultado do comando
+        process = subprocess.Popen(gum_cmd, stdin=subprocess.PIPE if input_text else None, 
+                                 stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
+        stdout, _ = process.communicate(input=input_text)
+        
+        class Result:
+            def __init__(self, stdout, returncode):
+                self.stdout = stdout
+                self.returncode = returncode
+        
+        return Result(stdout.strip(), process.returncode)
+    except Exception as e:
+        if not silent: print(f"Erro no spinner: {e}")
+        return run_command(command, input_text=input_text, silent=silent)
 
 def clean_styled_text(text):
     """Remove sequências de escape ANSI do gum style."""
@@ -550,23 +562,28 @@ def main():
 
     if not clean_txt.exists():
         with open(vtt_file, 'r', encoding='utf-8') as f: content = f.read()
-        lines = content.splitlines()
+        
+        # Faz a deduplicação PESADA (palavra por palavra) na legenda completa
+        print("--- 🧹 Limpando e deduplicando legenda completa ---")
+        master_words = parse_youtube_vtt_to_words(content, 0, 99999999)
+        
+        # Gera o clean_transcript.txt para o Gemini a partir das palavras limpas
         clean_lines = []
         word_count = 0
-        m_val, s_val = 0, 0
-        for line in lines:
-            if '-->' in line:
-                m = re.search(r'(\d+:\d+:\d+\.\d+|\d+:\d+\.\d+)', line)
-                if m:
-                    ts_ms = to_ms(norm_ts(m.group(1)))
-                    m_val, s_val = ts_ms // 60000, (ts_ms % 60000) // 1000
-            elif line.strip() and not line.startswith("WEBVTT") and 'Kind:' not in line and 'Language:' not in line:
-                text = re.sub(r'<[^>]+>', '', line).strip()
-                if text and (not clean_lines or text != re.sub(r'\[\d+:\d+\] ', '', clean_lines[-1]).strip()):
-                    if word_count % 10 == 0: clean_lines.append(f"[{m_val:02}:{s_val:02}] {text}")
-                    else: clean_lines.append(text)
-                    word_count += len(text.split())
-        with open(clean_txt, "w", encoding="utf-8") as f: f.write("\n".join(clean_lines))
+        for w in master_words:
+            m_val, s_val = w['start'] // 60000, (w['start'] % 60000) // 1000
+            if word_count % 10 == 0:
+                clean_lines.append(f"\n[{m_val:02}:{s_val:02}] {w['word']}")
+            else:
+                clean_lines.append(w['word'])
+            word_count += 1
+            
+        with open(clean_txt, "w", encoding="utf-8") as f:
+            f.write(" ".join(clean_lines))
+    else:
+        # Se o clean_txt já existe, apenas carregamos master_words para o TUI
+        with open(vtt_file, 'r', encoding='utf-8') as f: content = f.read()
+        master_words = parse_youtube_vtt_to_words(content, 0, 99999999)
 
     if not analysis_json.exists():
         prompt = (
