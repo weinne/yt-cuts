@@ -46,36 +46,43 @@ def draw_progress_bar(percent, title="Processando"):
 
 def run_progress_command(command, title="Processando", total_duration=None):
     """Executa comando e tenta extrair progresso para exibir uma barra."""
-    if "yt-dlp" in command[0]:
-        # Para yt-dlp, usamos --newline para facilitar o parse
-        cmd = command + ["--newline", "--progress"]
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for line in process.stdout:
-            # Padrão: [download]  10.5% of 100MiB at ...
-            m = re.search(r"(\d+\.\d+)%", line)
-            if m:
-                draw_progress_bar(float(m.group(1)), title)
-        process.wait()
-        print() # Nova linha ao fim
-        return process.returncode == 0
+    try:
+        if "yt-dlp" in command[0]:
+            # yt-dlp: --progress-template para garantir formato estável
+            cmd = command + ["--newline", "--progress", "--progress-template", "download:%(progress._percent_str)s"]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in process.stdout:
+                # O template acima gera algo como "download: 10.5%"
+                if "download:" in line:
+                    m = re.search(r"(\d+(\.\d+)?)%", line)
+                    if m:
+                        draw_progress_bar(float(m.group(1)), title)
+            process.wait()
+            print()
+            return process.returncode == 0
 
-    elif "ffmpeg" in command[0]:
-        # Para ffmpeg, usamos -progress pipe:1
-        cmd = command + ["-progress", "pipe:1", "-nostats"]
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        
-        cur_time = 0
-        for line in process.stdout:
-            if "out_time_ms=" in line:
-                try:
-                    time_ms = int(line.split('=')[1])
-                    if total_duration and total_duration > 0:
-                        percent = min(100, (time_ms / 1000) / total_duration * 100)
-                        draw_progress_bar(percent, title)
-                except: pass
-        process.wait()
-        print()
-        return process.returncode == 0
+        elif "ffmpeg" in command[0]:
+            # ffmpeg progress: out_time_ms é em microsegundos
+            cmd = command + ["-progress", "pipe:1", "-nostats", "-loglevel", "quiet"]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            for line in process.stdout:
+                if "out_time_ms=" in line:
+                    try:
+                        # out_time_ms=1000000 (1 segundo)
+                        time_us = int(line.split('=')[1])
+                        if total_duration and total_duration > 0:
+                            percent = min(100.0, (time_us / 1000000.0) / total_duration * 100.0)
+                            draw_progress_bar(percent, title)
+                    except: pass
+                if "progress=end" in line:
+                    draw_progress_bar(100.0, title)
+            
+            process.wait()
+            print()
+            return process.returncode == 0
+    except Exception as e:
+        return run_spin_command(command, title).returncode == 0
     
     return run_spin_command(command, title).returncode == 0
 
