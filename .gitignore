@@ -6,5 +6,6 @@ insta_session.json
 *.mp4
 *.srt
 *.jpg
+clean_transcript.txt
 __pycache__/
 .DS_Store

@@ -8,41 +8,32 @@ from pathlib import Path
 from instagrapi import Client
 from instagrapi.exceptions import TwoFactorRequired
 
-def run_command(command, shell=False, check=True):
-    print(f"Executing: {' '.join(command) if isinstance(command, list) else command}")
-    result = subprocess.run(command, shell=shell, capture_output=True, text=True)
+def run_command(command, shell=False, check=True, input_text=None, silent=True):
+    if not silent:
+        print(f"Executing: {' '.join(command) if isinstance(command, list) else command}")
+    result = subprocess.run(command, shell=shell, capture_output=True, text=True, input=input_text)
     if result.returncode != 0 and check:
         print(f"Error: {result.stderr}")
     return result
+
+def run_spin_command(command, title="Processando...", silent=True, input_text=None):
+    """Executa um comando exibindo um spinner do gum."""
+    gum_cmd = ["gum", "spin", "--spinner", "dot", "--title", title, "--"] + command
+    result = subprocess.run(gum_cmd, capture_output=True, text=True, input=input_text)
+    if result.returncode != 0 and not silent:
+        print(f"Erro em '{title}': {result.stderr}")
+    return result
+
+def clean_styled_text(text):
+    """Remove sequências de escape ANSI do gum style."""
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
 
 def clean_json_response(response_text):
     """Remove markdown formatting and extract JSON string."""
     response_text = re.sub(r'```json\s*', '', response_text)
     response_text = re.sub(r'```\s*', '', response_text)
     return response_text.strip()
-
-def clean_vtt(vtt_path):
-    with open(vtt_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-    
-    clean_lines = []
-    for line in lines:
-        if '-->' in line or 'WEBVTT' in line or 'Kind:' in line or 'Language:' in line:
-            continue
-        line = re.sub(r'<[^>]+>', '', line).strip()
-        if line:
-            clean_lines.append(line)
-    
-    unique_lines = []
-    for line in clean_lines:
-        if not unique_lines:
-            unique_lines.append(line)
-        elif line.startswith(unique_lines[-1]):
-            unique_lines[-1] = line
-        elif not unique_lines[-1].startswith(line):
-            unique_lines.append(line)
-            
-    return " ".join(unique_lines)
 
 def to_ms(t):
     parts = re.split('[:.]', t)
@@ -66,6 +57,98 @@ def format_ts(ms):
     ms %= 1000
     return f"{h:02}:{m:02}:{s:02}.{ms:03}"
 
+def get_audio_channels_info(file_path):
+    """Analisa os níveis de áudio por canal para detectar canais silenciosos."""
+    cmd = [
+        "ffmpeg", "-i", str(file_path),
+        "-af", "astats=metadata=1:reset=1",
+        "-f", "null", "-"
+    ]
+    res = run_command(cmd, check=False)
+    output = res.stderr
+    
+    channels_rms = {}
+    lines = output.splitlines()
+    current_channel = None
+    for line in lines:
+        if "Channel:" in line:
+            match = re.search(r"Channel:\s+(\d+)", line)
+            if match:
+                current_channel = int(match.group(1))
+        elif "RMS level dB:" in line and current_channel is not None:
+            match = re.search(r"RMS level dB:\s+([\-\d\.\w]+)", line)
+            if match:
+                val_str = match.group(1)
+                try:
+                    val = float(val_str)
+                except ValueError:
+                    if "inf" in val_str.lower():
+                        val = -100.0
+                    else:
+                        continue
+                channels_rms[current_channel] = val
+                
+    return channels_rms
+
+def get_non_silent_intervals(file_path, noise=-45, duration=0.3):
+    """Detecta intervalos não-silenciosos para sincronizar vídeo e áudio, com buffer de segurança."""
+    cmd = [
+        "ffmpeg", "-i", str(file_path),
+        "-af", f"silencedetect=noise={noise}dB:d={duration}",
+        "-f", "null", "-"
+    ]
+    res = run_command(cmd, check=False)
+    output = res.stderr
+    
+    silence_ranges = []
+    current_start = None
+    
+    for line in output.splitlines():
+        if "silence_start" in line:
+            m = re.search(r"silence_start: ([\d\.]+)", line)
+            if m: current_start = float(m.group(1))
+        elif "silence_end" in line:
+            m = re.search(r"silence_end: ([\d\.]+)", line)
+            if m:
+                end = float(m.group(1))
+                if current_start is not None:
+                    silence_ranges.append((current_start, end))
+                    current_start = None
+                else:
+                    silence_ranges.append((0.0, end))
+
+    # FFmpeg doesn't always show the final silence_end
+    # So we get total duration first
+    dur_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)]
+    dur_res = run_command(dur_cmd, check=False)
+    try:
+        total_duration = float(dur_res.stdout.strip())
+    except:
+        total_duration = 99999
+        
+    non_silent = []
+    last_pos = 0.0
+    buffer = 0.2
+    
+    for s_start, s_end in silence_ranges:
+        start = max(0, last_pos - buffer)
+        end = min(total_duration, s_start + buffer)
+        
+        if end > start + 0.1:
+            non_silent.append((start, end))
+        last_pos = s_end
+
+    if last_pos < total_duration:
+        start = max(0, last_pos - buffer)
+        end = total_duration
+        if end > start + 0.1:
+            non_silent.append((start, end))
+
+    if not non_silent:
+        non_silent = [(0.0, total_duration)]
+
+    return non_silent
+
 def parse_youtube_vtt_to_words(vtt_content, start_ms, end_ms):
     """Extrai palavras e timestamps, usando sobreposição de sequências para deduplicar rolling captions."""
     master_words = []
@@ -81,14 +164,14 @@ def parse_youtube_vtt_to_words(vtt_content, start_ms, end_ms):
                 cues.append({'ts': current_ts, 'text': " ".join(current_text_lines)})
             current_ts = line
             current_text_lines = []
-        elif line.strip() and not line.startswith("WEBVTT"):
+        elif line.strip() and not line.startswith("WEBVTT") and 'Kind:' not in line and 'Language:' not in line:
             current_text_lines.append(line.strip())
     if current_ts:
         cues.append({'ts': current_ts, 'text': " ".join(current_text_lines)})
 
     # 2. Processamento incremental para montagem da master list
     for cue in cues:
-        ts_match = re.findall(r'(\d+:\d+:\d+\.\d+|\d+:\d+\.\d+)', cue['ts'])
+        ts_match = re.findall(r'(\d+:\d+:\d+\.\d+|\d+:\d+\.\d+|\d+:\d+:\d+|\d+:\d+)', cue['ts'])
         if not ts_match: continue
         c_start = to_ms(norm_ts(ts_match[0]))
         c_end = to_ms(norm_ts(ts_match[1]))
@@ -98,10 +181,12 @@ def parse_youtube_vtt_to_words(vtt_content, start_ms, end_ms):
         parts = re.split(r'(<[^>]+>)', cue['text'])
         last_ts = c_start
         for p in parts:
-            if p.startswith('<') and ':' in p:
-                try:
-                    last_ts = to_ms(norm_ts(p[1:-1]))
-                except: pass
+            if p.startswith('<'):
+                m = re.search(r'(\d+:\d+:\d+\.\d+|\d+:\d+\.\d+)', p)
+                if m:
+                    try:
+                        last_ts = to_ms(norm_ts(m.group(1)))
+                    except: pass
             else:
                 clean_p = re.sub(r'<[^>]+>', '', p).strip()
                 if clean_p:
@@ -114,9 +199,7 @@ def parse_youtube_vtt_to_words(vtt_content, start_ms, end_ms):
             master_words.extend(cue_words)
             continue
             
-        # Busca a maior sobreposição de sequência de palavras no final da master list
         max_overlap = 0
-        # Olhamos até as últimas 50 palavras para encontrar a sobreposição
         lookback = min(len(master_words), 50)
         for i in range(1, min(lookback, len(cue_words)) + 1):
             master_suffix = [mw['word'].lower() for mw in master_words[-i:]]
@@ -124,7 +207,6 @@ def parse_youtube_vtt_to_words(vtt_content, start_ms, end_ms):
             if master_suffix == cue_prefix:
                 max_overlap = i
         
-        # Adiciona apenas as palavras que vêm após a sobreposição
         master_words.extend(cue_words[max_overlap:])
 
     if not master_words: return []
@@ -136,12 +218,16 @@ def parse_youtube_vtt_to_words(vtt_content, start_ms, end_ms):
         else:
             master_words[i]['end'] = master_words[i]['start'] + 200
 
-    segment_words = [w for w in master_words if w['start'] >= start_ms and w['start'] <= end_ms]
+    segment_words = [w for w in master_words if w['start'] >= (start_ms - 1000) and w['start'] <= (end_ms + 1000)]
+    
     for w in segment_words:
         w['start'] -= start_ms
         w['end'] -= start_ms
+        if w['start'] < 0: w['start'] = 0
+        if w['end'] < 100: w['end'] = 100
         
     return segment_words
+
 
 def generate_vtt_from_words(words, words_per_cue=3):
     vtt = ["WEBVTT", ""]
@@ -169,75 +255,51 @@ def get_duration(video_path):
 
 def extract_text_from_vtt(vtt_path):
     if not os.path.exists(vtt_path): return ""
-    with open(vtt_path, 'r', encoding='utf-8') as f:
+    with open(vtt_path, "r", encoding="utf-8") as f:
         content = f.read()
+    
     lines = content.splitlines()
     text_lines = []
     for line in lines:
-        if '-->' in line or 'WEBVTT' in line or not line.strip():
+        if '-->' in line or not line.strip() or line.startswith("WEBVTT"):
             continue
         text_lines.append(line.strip())
     return " ".join(text_lines)
 
+def generate_description(title, polished_text, video_url):
+    instructions = (
+        "Você é um social media manager. Crie uma descrição curta e impactante para este Reels/Short.\n"
+        "Inclua hashtags relevantes e um Call to Action (CTA) para seguir o perfil e ver o vídeo completo.\n"
+        f"Link do vídeo original: {video_url}\n\n"
+        "Texto do vídeo:\n"
+    )
+    result = run_spin_command(["gemini", "-m", "gemini-3.1-flash-lite", "-p", instructions], input_text=polished_text, title="Gerando descrição viral...")
+    return result.stdout.strip()
+
 def generate_thumbnail(video_path, title, output_path):
     duration = get_duration(video_path)
-    middle = duration / 2
-    font_path = "/home/weinne/.local/share/fonts/c/CrimsonPro_VariableFont_wght.ttf"
+    timestamp = duration / 2
     
-    # Simple line wrapping for drawtext
-    words = title.split()
-    lines = []
-    curr = []
-    for w in words:
-        if len(" ".join(curr + [w])) > 15:
-            lines.append(" ".join(curr))
-            curr = [w]
-        else:
-            curr.append(w)
-    lines.append(" ".join(curr))
-    wrapped_title = "\n".join(lines).replace("'", "'\\''").replace(":", "\\:")
-
-    vf = (
-        f"gblur=sigma=20,"
-        f"drawbox=t=fill:color=0x002200@0.7,"
-        f"drawbox=x=60:y=60:w=iw-120:h=ih-120:color=white@0.3:t=5,"
-        f"drawtext=fontfile='{font_path}':text='{wrapped_title}':fontcolor=white:fontsize=80:"
-        f"line_spacing=20:x=(w-text_w)/2:y=(h-text_h)/2"
-    )
-
-    print(f"--- Generating thumbnail: {output_path} ---")
-    run_command([
-        "ffmpeg", "-y", "-ss", str(middle), "-i", str(video_path),
-        "-frames:v", "1", "-vf", vf, str(output_path)
-    ])
-
-def generate_description(title, polished_text, video_url):
-    print("--- Generating video description with Gemini Flash ---")
-    prompt = (
-        f"Gere uma descrição atraente para um Short do YouTube/Instagram/TikTok.\n"
-        f"Título do momento: {title}\n"
-        f"Conteúdo: {polished_text}\n"
-        f"Vídeo original: {video_url}\n"
-        "A descrição deve ser curta, incluir emojis e hashtags relevantes. Responda APENAS com a descrição."
-    )
-    result = run_command(["gemini", "-m", "gemini-3.1-flash-lite", "-p", prompt])
-    return clean_json_response(result.stdout)
+    cmd = [
+        "ffmpeg", "-y", "-ss", str(timestamp), "-i", str(video_path),
+        "-frames:v", "1", "-q:v", "2", str(output_path)
+    ]
+    run_command(cmd, silent=True)
+    return output_path.exists()
 
 def get_insta_client():
     cl = Client()
     session_file = "insta_session.json"
-    
+
     if os.path.exists(session_file):
-        print("--- Carregando sessão do Instagram ---")
         cl.load_settings(session_file)
-    
+
     username = os.getenv("INSTA_USER") or input("Instagram Username: ")
     password = os.getenv("INSTA_PASS") or input("Instagram Password: ")
 
     try:
         cl.login(username, password)
     except TwoFactorRequired:
-        print("--- Autenticação em 2 etapas detectada ---")
         verification_code = input("Digite o código 2FA: ")
         cl.login(username, password, verification_code=verification_code)
     except Exception as e:
@@ -253,7 +315,7 @@ def get_insta_client():
 def schedule_instagram_post(video_path, caption, thumbnail_path, schedule_time_str, collaborators=None):
     queue_dir = Path("insta_queue")
     queue_dir.mkdir(exist_ok=True)
-    
+
     post_id = f"post_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     post_data = {
         "video": str(video_path.absolute()),
@@ -262,31 +324,179 @@ def schedule_instagram_post(video_path, caption, thumbnail_path, schedule_time_s
         "scheduled_for": schedule_time_str,
         "collaborators": collaborators or []
     }
-    
+
     with open(queue_dir / f"{post_id}.json", "w", encoding="utf-8") as f:
         json.dump(post_data, f, indent=4)
-    
+
     print(f"\n✅ Post agendado para {schedule_time_str}!")
-    if collaborators:
-        print(f"👥 {len(collaborators)} colaborador(es) adicionado(s).")
-    print(f"Dados salvos em: {queue_dir / f'{post_id}.json'}")
 
 def get_video_id(url):
     result = run_command(["yt-dlp", "--get-id", url])
     return result.stdout.strip()
 
+def run_gum(command, input_text=None):
+    """Executa o gum garantindo que o TUI seja visível e interativo."""
+    import sys
+    try:
+        if "pager" in command:
+            subprocess.run(command, input=input_text, text=True, stderr=sys.stderr, stdout=sys.stdout)
+            return ""
+        
+        if input_text:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
+            stdout, _ = process.communicate(input=input_text)
+            return stdout.strip()
+        else:
+            process = subprocess.Popen(command, stdin=sys.stdin, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
+            stdout, _ = process.communicate()
+            return stdout.strip()
+    except Exception as e:
+        return ""
+
+def stage1_preview(video_url, start_time, end_time, short_dir):
+    """ETAPA 1: Módulo de Preview Dinâmico no Terminal"""
+    preview_file = short_dir / "preview_low.mp4"
+    test_clip = short_dir / "preview_test.mp4"
+    
+    s_ms = to_ms(norm_ts(start_time))
+    e_ms = to_ms(norm_ts(end_time))
+    preview_dur_ms = min(30000, max(15000, e_ms - s_ms))
+    if (e_ms - s_ms) < 15000:
+        preview_dur_ms = e_ms - s_ms
+        
+    preview_end_ts = format_ts(s_ms + preview_dur_ms)
+
+    # Download preview section with spin
+    run_spin_command([
+        "yt-dlp", "-f", "worstvideo[height<=240][fps<=15]+worstaudio/worst",
+        "--download-sections", f"*{start_time}-{preview_end_ts}",
+        "-o", str(preview_file), video_url
+    ], title="Baixando trecho para preview...")
+
+    if not preview_file.exists():
+        return False
+
+    # Process test clip with spin
+    run_spin_command([
+        "ffmpeg", "-y", "-i", str(preview_file),
+        "-vf", "crop=ih*(9/16):ih:(iw-ow)/2:0,scale=w=-2:h=480",
+        "-c:v", "libx264", "-preset", "ultrafast", str(test_clip)
+    ], title="Processando preview...")
+
+    try:
+        subprocess.run(["mpv", "--ontop", "--no-terminal", str(test_clip)], check=False)
+    except:
+        subprocess.run(["xdg-open", str(test_clip)], check=False)
+
+    confirm = run_gum(["gum", "confirm", "O enquadramento está correto?"])
+    
+    if preview_file.exists(): preview_file.unlink()
+    if test_clip.exists(): test_clip.unlink()
+
+    return confirm == "true"
+
+def stage2_render_premium(video_url, start_time, end_time, srt_path, output_path, short_dir):
+    """ETAPA 2: Pipeline de Renderização Premium (Matriz FFmpeg)"""
+    high_res_file = short_dir / "high_res_segment.mp4"
+
+    if not high_res_file.exists():
+        run_spin_command([
+            "yt-dlp", "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/mp4",
+            "--download-sections", f"*{start_time}-{end_time}",
+            "-o", str(high_res_file), video_url
+        ], title="Baixando vídeo em alta resolução...")
+
+    if not high_res_file.exists():
+        return False
+
+    escaped_srt = str(srt_path).replace(":", "\\:").replace("'", "'\\''")
+    style = "FontSize=12,FontName=Verdana,Bold=1,PrimaryColour=&H00FFFFFF,Alignment=10,MarginV=10"
+
+    intervals = get_non_silent_intervals(high_res_file)
+    between_expr = "+".join([f"between(t,{s:.3f},{e:.3f})" for s, e in intervals])
+
+    fps_cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", str(high_res_file)]
+    fps_res = run_command(fps_cmd, check=False)
+    fps = fps_res.stdout.strip()
+    if not fps or fps == "0/0": fps = "30"
+
+    vf = [
+        f"select='{between_expr}'",
+        "hqdn3d=1.5:1.5:3:3",
+        "crop=ih*(9/16):ih:(iw-ow)/2:0",
+        "scale=1080:1920:flags=lanczos",
+        "colorbalance=rm=-0.08:rh=-0.03",
+        "eq=gamma=1.10:contrast=1.12:brightness=-0.02:saturation=1.1",
+        "unsharp=5:5:1.0",
+        "cas=strength=0.8",
+        f"subtitles='{escaped_srt}':force_style='{style}'",
+        f"setpts=N/({fps})/TB"
+    ]
+
+    rms_stats = get_audio_channels_info(high_res_file)
+    audio_fix = None
+    if len(rms_stats) >= 2:
+        c1 = rms_stats.get(1, -100)
+        c2 = rms_stats.get(2, -100)
+        if abs(c1 - c2) > 10:
+            audio_fix = "pan=stereo|c0=c0+c1|c1=c0+c1" if c1 > c2 else "pan=stereo|c0=c1+c0|c1=c1+c0"
+
+    af = [f"aselect='{between_expr}'", "asetpts=PTS-STARTPTS"]
+    if audio_fix: af.append(audio_fix)
+    af.extend(["acompressor=threshold=-12dB:ratio=4:attack=5:release=50", "loudnorm=I=-16:TP=-1.5:LRA=11"])
+
+    cmd = [
+        "ffmpeg", "-y", "-i", str(high_res_file),
+        "-vf", ",".join(vf),
+        "-af", ",".join(af),
+        "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        str(output_path)
+    ]
+    
+    result = run_spin_command(cmd, title="Renderizando vídeo premium (FFmpeg)...")
+    return output_path.exists()
+
+def start_file_server(port=None, directory="outputs"):
+    """Inicia um servidor web básico em background para servir os arquivos gerados."""
+    import http.server
+    import socketserver
+    import threading
+    
+    # Se port não for passado, tenta ler do ambiente (padrão Coolify/PaaS)
+    if port is None:
+        port = int(os.getenv("PORT", 8080))
+    
+    os.makedirs(directory, exist_ok=True)
+    
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=directory, **kwargs)
+        def log_message(self, format, *args):
+            return 
+
+    def run():
+        try:
+            with socketserver.TCPServer(("", port), Handler) as httpd:
+                httpd.serve_forever()
+        except Exception:
+            pass 
+            
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return port
+
 def main():
+    # Inicia o servidor de arquivos no background
+    server_port = start_file_server()
     if len(sys.argv) < 2:
         print("Usage: python sermon_to_shorts.py [YOUTUBE_URL]")
         return
 
     video_url = sys.argv[1]
     video_id = get_video_id(video_url)
-    if not video_id:
-        print("Error: Could not extract video ID.")
-        return
+    if not video_id: return
 
-    # Project setup
     project_dir = Path(f"outputs/{video_id}")
     project_dir.mkdir(parents=True, exist_ok=True)
     
@@ -294,274 +504,185 @@ def main():
     clean_txt = project_dir / "clean_transcript.txt"
     analysis_json = project_dir / "analysis.json"
 
-    # 1. Download subtitles (Cache check)
     if not vtt_file.exists():
-        print("--- Fetching subtitles ---")
-        run_command([
+        run_spin_command([
             "yt-dlp", "--write-auto-subs", "--write-subs", 
             "--sub-langs", "pt.*,en.*", "--sub-format", "vtt", 
             "--skip-download", "-o", str(project_dir / "transcript"), video_url
-        ])
+        ], title="Buscando legendas...")
         
-        # Robustly find the transcript file
         found_vtt = None
         for suffix in [".pt.vtt", ".pt-orig.vtt", ".en.vtt", ".vtt"]:
-            potential_file = project_dir / f"transcript{suffix}"
-            if potential_file.exists():
-                found_vtt = potential_file
-                break
-        
-        if found_vtt:
-            os.rename(found_vtt, vtt_file)
-        else:
-            print("Error: Could not download subtitles.")
-            return
-    else:
-        print(f"--- Subtitles found in cache: {vtt_file} ---")
+            f = project_dir / f"transcript{suffix}"
+            if f.exists(): found_vtt = f; break
+        if found_vtt: os.rename(found_vtt, vtt_file)
+        else: return
 
     if not clean_txt.exists():
-        with open(vtt_file, 'r', encoding='utf-8') as f:
-            content = f.read()
-        # Simplistic clean for analysis
-        text = re.sub(r'<[^>]+>', '', content)
-        text = re.sub(r'\d+:\d+:\d+\.\d+ --> \d+:\d+:\d+\.\d+.*', '', text)
-        lines = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("WEBVTT")]
-        # Deduplicate lines for cleaner analysis
-        unique_lines = []
-        for l in lines:
-            if not unique_lines or l != unique_lines[-1]:
-                unique_lines.append(l)
-        with open(clean_txt, "w", encoding="utf-8") as f:
-            f.write(" ".join(unique_lines))
+        with open(vtt_file, 'r', encoding='utf-8') as f: content = f.read()
+        lines = content.splitlines()
+        clean_lines = []
+        word_count = 0
+        m_val, s_val = 0, 0
+        for line in lines:
+            if '-->' in line:
+                m = re.search(r'(\d+:\d+:\d+\.\d+|\d+:\d+\.\d+)', line)
+                if m:
+                    ts_ms = to_ms(norm_ts(m.group(1)))
+                    m_val, s_val = ts_ms // 60000, (ts_ms % 60000) // 1000
+            elif line.strip() and not line.startswith("WEBVTT") and 'Kind:' not in line and 'Language:' not in line:
+                text = re.sub(r'<[^>]+>', '', line).strip()
+                if text and (not clean_lines or text != re.sub(r'\[\d+:\d+\] ', '', clean_lines[-1]).strip()):
+                    if word_count % 10 == 0: clean_lines.append(f"[{m_val:02}:{s_val:02}] {text}")
+                    else: clean_lines.append(text)
+                    word_count += len(text.split())
+        with open(clean_txt, "w", encoding="utf-8") as f: f.write("\n".join(clean_lines))
 
-    # 2. Analyze with Gemini
     if not analysis_json.exists():
-        print("--- Analyzing with Gemini (Pro Model) ---")
         prompt = (
-            "Analise a transcrição deste sermão e encontre os 3 melhores momentos para criar vídeos virais.\n"
-            "Retorne EXCLUSIVAMENTE um JSON: "
-            '[{"start": "MM:SS", "end": "MM:SS", "title": "...", "reason": "..."}]'
+            "Você é um estrategista de conteúdo viral religioso.\n"
+            "Analise a transcrição e encontre os 10 melhores momentos (30-75s).\n"
+            "IMPORTANTE: NÃO CORTE ideias no meio. Seja preciso com timestamps [MM:SS].\n"
+            "Retorne JSON: " + '[{"start": "MM:SS", "end": "MM:SS", "title": "...", "score": 95, "reason": "..."}]'
         )
-        gemini_cmd = ["gemini", "-m", "gemini-3.1-pro-preview", "-p", f"@{clean_txt} {prompt}", "-o", "json"]
-        result = run_command(gemini_cmd)
+        with open(clean_txt, 'r', encoding='utf-8') as f: transcript = f.read()
+        gemini_cmd = ["gemini", "-m", "gemini-3.1-pro-preview", "-p", prompt, "-o", "json"]
+        result = run_spin_command(gemini_cmd, input_text=transcript, title="Gemini analisando ganchos virais...")
         try:
-            gemini_data = json.loads(result.stdout)
-            raw_response = gemini_data['response'] if 'response' in gemini_data else result.stdout
-            moments_json = clean_json_response(raw_response)
-            json.loads(moments_json)
-            with open(analysis_json, "w", encoding="utf-8") as f:
-                f.write(moments_json)
-        except Exception as e:
-            print(f"Failed to parse Gemini response: {e}")
-            return
-    
-    with open(analysis_json, "r", encoding="utf-8") as f:
-        moments = json.load(f)
-
-    # 3. User Selection
-    print("\n--- Escolha os momentos para processar ---")
-    for i, m in enumerate(moments):
-        print(f"{i+1}. [{m['start']} - {m['end']}] {m['title']}")
-    
-    choice_input = input("Escolha (1-3, 'todos', 'q'): ")
-    if choice_input.lower() == 'q': return
-    selected_indices = list(range(len(moments))) if choice_input.lower() == 'todos' else [int(x.strip()) - 1 for x in choice_input.split(',')]
-
-    for idx in selected_indices:
-        selected = moments[idx]
-        safe_title = re.sub(r'[^a-zA-Z0-9]', '_', selected['title'])[:20]
-        short_id = f"momo_{idx+1}_{selected['start'].replace(':', '')}_{safe_title}"
-        short_dir = project_dir / "shorts" / short_id
-        short_dir.mkdir(parents=True, exist_ok=True)
-
-        segment_file = short_dir / "segment.mp4"
-        edited_vtt = short_dir / "edited.vtt"
-        final_video = short_dir / "final.mp4"
-
-        # 4. Download segment
-        if not segment_file.exists():
-            run_command(["yt-dlp", "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/mp4", 
-                         "--download-sections", f"*{selected['start']}-{selected['end']}", 
-                         "-o", str(segment_file), video_url])
-
-        # 5. Subtitles with Word-Level Sync
-        if not edited_vtt.exists():
-            print("--- Processing Subtitles with Word-Level Sync ---")
-            with open(vtt_file, 'r', encoding='utf-8') as f:
-                vtt_content = f.read()
-            
-            s_ms = to_ms(norm_ts(selected['start']))
-            e_ms = to_ms(norm_ts(selected['end']))
-            
-            words = parse_youtube_vtt_to_words(vtt_content, s_ms, e_ms)
-            
-            if not words:
-                print("Warning: No words found for this segment.")
-                continue
-
-            # Optional: Polish text with Gemini (preserving words)
-            raw_text = " ".join([w['word'] for w in words])
-            polish_prompt = (
-                "Você é um editor de legendas. Sua tarefa é adicionar PONTUAÇÃO e corrigir GRAMÁTICA do texto.\n"
-                "IMPORTANTE: Você NÃO pode remover nem repetir palavras. Mantenha a ordem exata.\n"
-                "As repetições brutas já foram removidas heuristicamente.\n"
-                f"TEXTO: {raw_text}"
-            )
-            print("--- Polishing text with Gemini ---")
-            polish_result = run_command(["gemini", "-m", "gemini-3.1-flash-lite", "-p", polish_prompt])
+            res = clean_json_response(result.stdout)
             try:
-                res_content = polish_result.stdout
-                try:
-                    polish_data = json.loads(res_content)
-                    polished_text = polish_data['response'] if 'response' in polish_data else res_content
-                except:
-                    polished_text = res_content
-            except:
-                polished_text = raw_text
+                data = json.loads(res)
+                if isinstance(data, dict) and 'response' in data: res = clean_json_response(data['response'])
+            except: pass
+            json.loads(res)
+            with open(analysis_json, "w", encoding="utf-8") as f: f.write(res)
+        except: return
+    
+    with open(analysis_json, "r", encoding="utf-8") as f: moments = json.load(f)
+
+    while True:
+        options = []
+        for i, m in enumerate(moments):
+            s = int(m.get('score', 0))
+            options.append(f"{i+1:02}. [{s} pts] ({m['start']}-{m['end']}) {m['title']}")
+        options.extend(["---", "➕ Recorte Personalizado", "🔄 Todos", "❌ Sair"])
+
+        sel_raw = run_gum(["gum", "choose", "--header", "🔥 Escolha um momento viral", "--height", "15", "--cursor.foreground", "212"], input_text="\n".join(options))
+        if not sel_raw or "Sair" in sel_raw: break
+        
+        if "Recorte Personalizado" in sel_raw:
+            if run_gum(["gum", "confirm", "Ver transcrição?"]) == "true":
+                run_gum(["gum", "pager"], input_text=open(clean_txt).read())
+            c_s = run_gum(["gum", "input", "--placeholder", "Início (MM:SS)"])
+            c_e = run_gum(["gum", "input", "--placeholder", "Fim (MM:SS)"])
+            c_t = run_gum(["gum", "input", "--placeholder", "Título"])
+            if c_s and c_e:
+                moments.append({"start": c_s, "end": c_e, "title": c_t or "Manual", "score": 100})
+                indices = [len(moments)-1]
+            else: continue
+        elif "Todos" in sel_raw: indices = list(range(len(moments)))
+        else:
+            indices = []
+            for line in sel_raw.splitlines():
+                try: indices.append(int(line.split('.')[0]) - 1)
+                except: continue
+
+        for idx in indices:
+            if idx < 0 or idx >= len(moments): continue
+            selected = moments[idx]
+            back_to_selection = False
+            s_ms = max(0, to_ms(norm_ts(selected['start'])) - 2000)
+            e_ms = to_ms(norm_ts(selected['end'])) + 2000
             
-            # Simple re-alignment: split polished text into words and map back
-            polished_words = clean_json_response(polished_text).split()
-            # If Gemini changed word count significantly, we fallback to original words
-            if abs(len(polished_words) - len(words)) < 5:
-                for i in range(min(len(words), len(polished_words))):
-                    words[i]['word'] = polished_words[i]
-            
-            final_vtt = generate_vtt_from_words(words)
-            with open(edited_vtt, "w", encoding="utf-8") as f:
-                f.write(final_vtt)
+            short_id = f"momo_{idx+1}_{selected['start'].replace(':', '')}_{re.sub(r'[^a-zA-Z0-9]', '_', selected['title'])[:15]}"
+            short_dir = project_dir / "shorts" / short_id
+            short_dir.mkdir(parents=True, exist_ok=True)
+            edited_vtt = short_dir / "edited.vtt"
+            final_video = short_dir / "final.mp4"
 
-        # Ensure polished_text is available for description
-        polished_text = extract_text_from_vtt(edited_vtt)
+            if not edited_vtt.exists():
+                with open(vtt_file, 'r', encoding='utf-8') as f: vtt_c = f.read()
+                while True:
+                    words = parse_youtube_vtt_to_words(vtt_c, s_ms, e_ms)
+                    print(f"\n--- ✂️ Ajuste: {selected['title']} ({format_ts(s_ms)} - {format_ts(e_ms)}) ---")
+                    act = run_gum(["gum", "choose", "Continuar", "Ajustar Início", "Ajustar Fim", "Ver Trecho", "Cancelar", "--height", "10"])
+                    if act == "Continuar": break
+                    if not act or act == "Cancelar": back_to_selection = True; break
+                    all_w = parse_youtube_vtt_to_words(vtt_c, 0, 9999999)
+                    if "Início" in act or "Fim" in act:
+                        c_idx = next((i for i, w in enumerate(all_w) if w['start'] >= (s_ms if "Início" in act else e_ms)), 0)
+                        window = all_w[max(0, c_idx-40):min(len(all_w), c_idx+40)]
+                        opts = ["<- Voltar"] + [f"{format_ts(w['start'])}: {w['word']}" for w in window]
+                        new_o = run_gum(["gum", "choose", "--header", f"Novo {'INÍCIO' if 'Início' in act else 'FIM'}", "--height", "15"] + opts)
+                        if new_o and new_o != "<- Voltar":
+                            if "Início" in act: s_ms = to_ms(new_o[:12])
+                            else: e_ms = to_ms(new_o[:12])
+                    elif act == "Ver Trecho": run_gum(["gum", "pager"], input_text=" ".join([w['word'] for w in words]))
 
-        # 6. Finalization
-        while True:
-            print(f"\n1. Editar legenda | 2. Gerar vídeo completo | 3. Gerar apenas descrição | 4. Gerar apenas miniatura | 5. Agendar no Instagram | 6. Próximo")
-            sub_choice = input("Escolha: ")
-            if sub_choice == '1':
-                subprocess.run(["micro" if subprocess.run(["which", "micro"], capture_output=True).returncode == 0 else "vim", str(edited_vtt)])
-            elif sub_choice == '2':
-                srt_file = short_dir / "segment.srt"
-                run_command(["ffmpeg", "-y", "-i", str(edited_vtt), str(srt_file)])
-                
-                # Style: White text, Size 12, Middle Center, Light Shadow (No Outline)
-                style = (
-                    "FontSize=12,"
-                    "FontName=Verdana,"
-                    "Bold=1,"
-                    "PrimaryColour=&H00FFFFFF,"   # White Text
-                    "OutlineColour=&H00000000,"   # Transparent/None
-                    "BackColour=&H80000000,"      # Semi-transparent Black Shadow
-                    "BorderStyle=1,"              # Outline + Shadow mode
-                    "Outline=0,"                  # No outline
-                    "Shadow=1,"                   # Light shadow, smaller distance
-                    "Alignment=10,"               # Middle Center
-                    "MarginV=0"
-                )
-                escaped_srt = str(srt_file).replace(":", "\\:").replace("'", "'\\''")
-                run_command([
-                    "ffmpeg", "-y", "-i", str(segment_file),
-                    "-vf", f"crop=ih*9/16:ih,scale=1080:1920,subtitles='{escaped_srt}':force_style='{style}'",
-                    "-c:v", "libx264", "-crf", "18", "-c:a", "aac", str(final_video)
-                ])
-                
-                # New: Thumbnail and Description
-                thumbnail_file = short_dir / "thumbnail.jpg"
-                generate_thumbnail(final_video, selected['title'], thumbnail_file)
-                
-                desc = generate_description(selected['title'], polished_text, video_url)
-                desc_file = short_dir / "description.txt"
-                with open(desc_file, "w", encoding="utf-8") as f:
-                    f.write(desc)
-                
-                print(f"\n✅ Concluído!")
-                print(f"Vídeo: {final_video}")
-                print(f"Thumbnail: {thumbnail_file}")
-                print(f"Descrição: {desc_file}")
-            elif sub_choice == '3':
-                desc = generate_description(selected['title'], polished_text, video_url)
-                desc_file = short_dir / "description.txt"
-                with open(desc_file, "w", encoding="utf-8") as f:
-                    f.write(desc)
-                print(f"\n--- Descrição Gerada ---\n{desc}\n------------------------")
-                print(f"Salvo em: {desc_file}")
-            elif sub_choice == '4':
-                thumbnail_file = short_dir / "thumbnail.jpg"
-                source = final_video if final_video.exists() else segment_file
-                generate_thumbnail(source, selected['title'], thumbnail_file)
-                print(f"✅ Thumbnail pronta: {thumbnail_file}")
-            elif sub_choice == '5':
-                if not final_video.exists():
-                    print("⚠️ Gere o vídeo (opção 2) primeiro!")
-                    continue
-                
-                # Garante que o usuário está logado e a sessão existe
-                cl = get_insta_client()
-                if not cl:
-                    print("⚠️ Falha ao autenticar no Instagram. O post não foi agendado.")
-                    continue
+                if back_to_selection or not words: continue
+                raw_t = " ".join([w['word'] for w in words])
+                polish_res = run_spin_command(["gemini", "-m", "gemini-3.1-flash-lite", "-p", "Pontue e corrija gramática: "], input_text=raw_t, title="Refinando texto...")
+                p_text = clean_json_response(polish_res.stdout)
+                p_words = p_text.split()
+                if abs(len(p_words) - len(words)) < 5:
+                    for i in range(min(len(words), len(p_words))): words[i]['word'] = p_words[i]
+                with open(edited_vtt, "w", encoding="utf-8") as f: f.write(generate_vtt_from_words(words))
 
-                desc_file = short_dir / "description.txt"
-                if desc_file.exists():
-                    with open(desc_file, "r", encoding="utf-8") as f:
-                        caption = f.read()
-                else:
-                    caption = "Sermão impactante! #fé #igreja"
+            while True:
+                polished_text = extract_text_from_vtt(edited_vtt)
+                print(f"\n--- 🎬 Shorts: {selected['title']} ---")
+                
+                if final_video.exists():
+                    # Calcula o caminho relativo para a URL
+                    rel_path = final_video.relative_to(Path("outputs"))
+                    base_url = os.getenv("PUBLIC_URL", f"http://localhost:{server_port}")
+                    # Garante que a base_url termina com / ou rel_path começa sem /
+                    full_url = f"{base_url.rstrip('/')}/{rel_path}"
+                    print(f"🔗 Download: {full_url}")
 
-                print(f"\n--- Legenda Atual ---\n{caption}\n--------------------")
-                edit_caption = input("Deseja editar a legenda? (s/n): ")
-                if edit_caption.lower() == 's':
-                    temp_desc = short_dir / "temp_desc.txt"
-                    with open(temp_desc, "w", encoding="utf-8") as f:
-                        f.write(caption)
-                    subprocess.run(["micro" if subprocess.run(["which", "micro"], capture_output=True).returncode == 0 else "vim", str(temp_desc)])
-                    with open(temp_desc, "r", encoding="utf-8") as f:
-                        caption = f.read()
-                    temp_desc.unlink()
-
-                collaborators = []
-                add_collab = input("Deseja adicionar colaboradores? (Usernames separados por vírgula ou Enter p/ pular): ")
-                if add_collab.strip():
-                    collab_list = [c.strip() for c in add_collab.split(",")]
-                    for username in collab_list:
-                        try:
-                            uid = cl.user_id_from_username(username)
-                            collaborators.append(uid)
-                            print(f"✅ Colaborador encontrado: {username} (ID: {uid})")
-                        except:
-                            print(f"❌ Usuário não encontrado: {username}")
-                
-                thumbnail_file = short_dir / "thumbnail.jpg"
-                if not thumbnail_file.exists():
-                    thumbnail_file = None
-                
-                print("\nQuando deseja postar?")
-                print("Formatos aceitos: 'agora', 'HH:MM', 'DD/MM HH:MM'")
-                time_input = input("Horário: ")
-                
-                now = datetime.datetime.now()
-                if time_input.lower() == 'agora':
-                    sched_time = now + datetime.timedelta(minutes=1)
-                elif len(time_input) == 5: # HH:MM
-                    try:
-                        sched_time = datetime.datetime.strptime(time_input, "%H:%M").replace(
-                            year=now.year, month=now.month, day=now.day
-                        )
-                        if sched_time < now:
-                            sched_time += datetime.timedelta(days=1)
-                    except:
-                        print("Formato inválido.")
-                        continue
-                else: # DD/MM HH:MM
-                    try:
-                        sched_time = datetime.datetime.strptime(time_input, "%d/%m %H:%M").replace(year=now.year)
-                    except:
-                        print("Formato inválido.")
-                        continue
-                
-                schedule_instagram_post(final_video, caption, thumbnail_file, sched_time.strftime("%Y-%m-%d %H:%M"), collaborators)
-
-            elif sub_choice == '6':
-                break
+                choice = run_gum(["gum", "choose", "--height", "12", "Preview", "Editar Legenda", "Renderizar", "Ver Descrição", "Nova Thumbnail", "Postar Instagram", "Próximo", "Voltar à Seleção", "Sair do Programa"])
+                if not choice or choice == "Voltar à Seleção": back_to_selection = True; break
+                if choice == "Sair do Programa": sys.exit(0)
+                if choice == "Preview": stage1_preview(video_url, format_ts(s_ms), format_ts(e_ms), short_dir)
+                elif choice == "Editar Legenda": subprocess.run(["micro" if subprocess.run(["which", "micro"], capture_output=True).returncode == 0 else "vim", str(edited_vtt)])
+                elif choice == "Renderizar":
+                    srt = short_dir / "segment.srt"
+                    run_command(["ffmpeg", "-y", "-i", str(edited_vtt), str(srt)])
+                    if stage2_render_premium(video_url, format_ts(s_ms), format_ts(e_ms), srt, final_video, short_dir):
+                        generate_thumbnail(final_video, selected['title'], short_dir / "thumbnail.jpg")
+                        desc = generate_description(selected['title'], polished_text, video_url)
+                        with open(short_dir / "description.txt", "w", encoding="utf-8") as f: f.write(desc)
+                        print(f"✅ Pronto: {final_video}")
+                elif choice == "Ver Descrição":
+                    df = short_dir / "description.txt"
+                    if df.exists(): run_gum(["gum", "pager"], input_text=open(df).read())
+                elif choice == "Nova Thumbnail": generate_thumbnail(final_video if final_video.exists() else (short_dir / "high_res_segment.mp4"), selected['title'], short_dir / "thumbnail.jpg")
+                elif choice == "Postar Instagram":
+                    if not final_video.exists(): continue
+                    cl = get_insta_client()
+                    if not cl: continue
+                    cap = open(short_dir / "description.txt").read()
+                    if run_gum(["gum", "confirm", "Editar legenda?"]) == "true":
+                        tmp = short_dir / "temp_desc.txt"
+                        with open(tmp, "w") as f: f.write(cap)
+                        subprocess.run(["micro" if subprocess.run(["which", "micro"], capture_output=True).returncode == 0 else "vim", str(tmp)])
+                        cap = open(tmp).read(); tmp.unlink()
+                    col_in = run_gum(["gum", "input", "--placeholder", "Colaboradores (csv)"])
+                    cols = []
+                    if col_in:
+                        for c in col_in.split(","):
+                            try: cols.append(cl.user_id_from_username(c.strip()))
+                            except: pass
+                    t_in = run_gum(["gum", "input", "--placeholder", "Horário"])
+                    now = datetime.datetime.now()
+                    if not t_in or t_in.lower() == 'agora': sch = now + datetime.timedelta(minutes=1)
+                    elif len(t_in) == 5:
+                        sch = datetime.datetime.strptime(t_in, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
+                        if sch < now: sch += datetime.timedelta(days=1)
+                    else: sch = datetime.datetime.strptime(t_in, "%d/%m %H:%M").replace(year=now.year)
+                    schedule_instagram_post(final_video, cap, short_dir / "thumbnail.jpg", sch.strftime("%Y-%m-%d %H:%M"), cols)
+                elif choice == "Próximo": break
+            if back_to_selection: break
 
 if __name__ == "__main__":
     main()

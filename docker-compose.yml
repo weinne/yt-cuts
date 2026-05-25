@@ -1,0 +1,19 @@
+services:
+  yt-cuts:
+    build: .
+    image: yt-cuts:latest
+    container_name: yt-cuts
+    tty: true
+    stdin_open: true
+    environment:
+      - INSTA_USER=${INSTA_USER}
+      - INSTA_PASS=${INSTA_PASS}
+      - PORT=${PORT:-8080}
+      - PUBLIC_URL=${PUBLIC_URL:-http://localhost:8080}
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    # Os arquivos serão limpos ao reiniciar pois não há volumes persistentes para 'outputs'
+    # Se quiser baixar os arquivos, pode usar um volume temporário ou SCP do container
+    volumes:
+      - ./insta_session.json:/app/insta_session.json
+    command: ["https://www.youtube.com/watch?v=EXEMPLO"]
