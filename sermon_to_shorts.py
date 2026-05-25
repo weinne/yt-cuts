@@ -601,15 +601,41 @@ def main():
         if not sel_raw or "Sair" in sel_raw: break
         
         if "Recorte Personalizado" in sel_raw:
-            if run_gum(["gum", "confirm", "Ver transcrição?"]) == "true":
-                run_gum(["gum", "pager"], input_text=open(clean_txt).read())
-            c_s = run_gum(["gum", "input", "--placeholder", "Início (MM:SS)"])
-            c_e = run_gum(["gum", "input", "--placeholder", "Fim (MM:SS)"])
-            c_t = run_gum(["gum", "input", "--placeholder", "Título"])
-            if c_s and c_e:
-                moments.append({"start": c_s, "end": c_e, "title": c_t or "Manual", "score": 100})
+            with open(vtt_file, 'r', encoding='utf-8') as f: vtt_c = f.read()
+            all_w = parse_youtube_vtt_to_words(vtt_c, 0, 99999999) # Pega todas as palavras
+            
+            if not all_w:
+                print("⚠️ Erro ao carregar palavras da legenda.")
+                continue
+
+            # 1. Selecionar palavra de INÍCIO
+            opts = [f"{format_ts(w['start'])}: {w['word']}" for w in all_w]
+            start_sel = run_gum(["gum", "choose", "--header", "📍 Selecione onde o recorte deve COMEÇAR", "--height", "20", "--filter"], input_text="\n".join(opts))
+            
+            if not start_sel: continue
+            c_s_ms = to_ms(start_sel[:12])
+            
+            # 2. Selecionar palavra de FIM (começando da palavra de início)
+            start_idx = next((i for i, w in enumerate(all_w) if w['start'] >= c_s_ms), 0)
+            end_opts = [f"{format_ts(w['start'])}: {w['word']}" for w in all_w[start_idx:]]
+            end_sel = run_gum(["gum", "choose", "--header", "🏁 Selecione onde o recorte deve TERMINAR", "--height", "20", "--filter"], input_text="\n".join(end_opts))
+            
+            if not end_sel: continue
+            c_e_ms = to_ms(end_sel[:12])
+            
+            c_t = run_gum(["gum", "input", "--placeholder", "Título do vídeo personalizado"])
+            
+            if c_s_ms < c_e_ms:
+                moments.append({
+                    "start": format_ts(c_s_ms)[3:8], # MM:SS para o JSON
+                    "end": format_ts(c_e_ms)[3:8], 
+                    "title": c_t or "Recorte Personalizado", 
+                    "score": 100
+                })
                 indices = [len(moments)-1]
-            else: continue
+            else:
+                print("⚠️ O fim deve ser após o início.")
+                continue
         elif "Todos" in sel_raw: indices = list(range(len(moments)))
         else:
             indices = []
