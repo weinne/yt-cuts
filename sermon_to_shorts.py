@@ -36,10 +36,48 @@ def run_spin_command(command, title="Processando...", silent=True, input_text=No
         if not silent: print(f"Erro no spinner: {e}")
         return run_command(command, input_text=input_text, silent=silent)
 
-def clean_styled_text(text):
-    """Remove sequências de escape ANSI do gum style."""
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    return ansi_escape.sub('', text)
+def draw_progress_bar(percent, title="Processando"):
+    """Desenha uma barra de progresso estilo TUI no terminal."""
+    width = 40
+    filled = int(width * percent / 100)
+    bar = "█" * filled + "░" * (width - filled)
+    sys.stdout.write(f"\r  {title} |{bar}| {percent:3.1f}% ")
+    sys.stdout.flush()
+
+def run_progress_command(command, title="Processando", total_duration=None):
+    """Executa comando e tenta extrair progresso para exibir uma barra."""
+    if "yt-dlp" in command[0]:
+        # Para yt-dlp, usamos --newline para facilitar o parse
+        cmd = command + ["--newline", "--progress"]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in process.stdout:
+            # Padrão: [download]  10.5% of 100MiB at ...
+            m = re.search(r"(\d+\.\d+)%", line)
+            if m:
+                draw_progress_bar(float(m.group(1)), title)
+        process.wait()
+        print() # Nova linha ao fim
+        return process.returncode == 0
+
+    elif "ffmpeg" in command[0]:
+        # Para ffmpeg, usamos -progress pipe:1
+        cmd = command + ["-progress", "pipe:1", "-nostats"]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        
+        cur_time = 0
+        for line in process.stdout:
+            if "out_time_ms=" in line:
+                try:
+                    time_ms = int(line.split('=')[1])
+                    if total_duration and total_duration > 0:
+                        percent = min(100, (time_ms / 1000) / total_duration * 100)
+                        draw_progress_bar(percent, title)
+                except: pass
+        process.wait()
+        print()
+        return process.returncode == 0
+    
+    return run_spin_command(command, title).returncode == 0
 
 def clean_json_response(response_text):
     """Remove markdown formatting and extract JSON string."""
@@ -408,12 +446,12 @@ def stage1_preview(video_url, start_time, end_time, short_dir):
         
     preview_end_ts = format_ts(s_ms + preview_dur_ms)
 
-    # Download preview section with spin
-    run_spin_command([
+    # Download preview section with progress
+    run_progress_command([
         "yt-dlp", "-f", "worstvideo[height<=240][fps<=15]+worstaudio/worst",
         "--download-sections", f"*{start_time}-{preview_end_ts}",
         "-o", str(preview_file), video_url
-    ], title="Baixando trecho para preview...")
+    ], title="Baixando trecho preview")
 
     if not preview_file.exists():
         return False
@@ -440,13 +478,16 @@ def stage1_preview(video_url, start_time, end_time, short_dir):
 def stage2_render_premium(video_url, start_time, end_time, srt_path, output_path, short_dir):
     """ETAPA 2: Pipeline de Renderização Premium (Matriz FFmpeg)"""
     high_res_file = short_dir / "high_res_segment.mp4"
+    
+    # Calcular duração para a barra de progresso
+    duration_secs = (to_ms(norm_ts(end_time)) - to_ms(norm_ts(start_time))) / 1000
 
     if not high_res_file.exists():
-        run_spin_command([
+        run_progress_command([
             "yt-dlp", "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/mp4",
             "--download-sections", f"*{start_time}-{end_time}",
             "-o", str(high_res_file), video_url
-        ], title="Baixando vídeo em alta resolução...")
+        ], title="Baixando alta resolução")
 
     if not high_res_file.exists():
         return False
@@ -496,8 +537,7 @@ def stage2_render_premium(video_url, start_time, end_time, srt_path, output_path
         str(output_path)
     ]
     
-    result = run_spin_command(cmd, title="Renderizando vídeo premium (FFmpeg)...")
-    return output_path.exists()
+    return run_progress_command(cmd, title="Renderizando vídeo premium", total_duration=duration_secs)
 
 def start_file_server(port=None, directory="outputs"):
     """Inicia um servidor web básico em background para servir os arquivos gerados."""
@@ -547,11 +587,11 @@ def main():
     analysis_json = project_dir / "analysis.json"
 
     if not vtt_file.exists():
-        run_spin_command([
+        run_progress_command([
             "yt-dlp", "--write-auto-subs", "--write-subs", 
             "--sub-langs", "pt.*,en.*", "--sub-format", "vtt", 
             "--skip-download", "-o", str(project_dir / "transcript"), video_url
-        ], title="Buscando legendas...")
+        ], title="Buscando legendas")
         
         found_vtt = None
         for suffix in [".pt.vtt", ".pt-orig.vtt", ".en.vtt", ".vtt"]:
@@ -611,10 +651,22 @@ def main():
         options = []
         for i, m in enumerate(moments):
             s = int(m.get('score', 0))
-            options.append(f"{i+1:02}. [{s} pts] ({m['start']}-{m['end']}) {m['title']}")
+            color = "10" if s > 90 else "11" if s > 80 else "14"
+            # Cria string estilizada para o gum choose
+            score_part = f"[{s} pts]"
+            time_part = f"({m['start']}-{m['end']})"
+            options.append(f"{i+1:02}. {score_part} {time_part} {m['title']}")
+        
         options.extend(["---", "➕ Recorte Personalizado", "🔄 Todos", "❌ Sair"])
 
-        sel_raw = run_gum(["gum", "choose", "--header", "🔥 Escolha um momento viral", "--height", "15", "--cursor.foreground", "212"], input_text="\n".join(options))
+        sel_raw = run_gum([
+            "gum", "choose", 
+            "--header", "🔥 Escolha um momento viral (ENTER para selecionar)", 
+            "--height", "15", 
+            "--cursor.foreground", "212",
+            "--selected.foreground", "212",
+            "--selected.bold"
+        ], input_text="\n".join(options))
         if not sel_raw or "Sair" in sel_raw: break
         
         if "Recorte Personalizado" in sel_raw:
