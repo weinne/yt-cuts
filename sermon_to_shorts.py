@@ -277,14 +277,43 @@ def generate_description(title, polished_text, video_url):
     return result.stdout.strip()
 
 def generate_thumbnail(video_path, title, output_path):
+    """Gera uma thumbnail rica com desfoque, overlay verde e título centralizado."""
     duration = get_duration(video_path)
-    timestamp = duration / 2
+    middle = duration / 2
     
-    cmd = [
-        "ffmpeg", "-y", "-ss", str(timestamp), "-i", str(video_path),
-        "-frames:v", "1", "-q:v", "2", str(output_path)
+    # Tenta localizar uma fonte válida
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/home/weinne/.local/share/fonts/c/CrimsonPro_VariableFont_wght.ttf"
     ]
-    run_command(cmd, silent=True)
+    font_path = next((p for p in font_paths if os.path.exists(p)), "")
+    font_arg = f":fontfile='{font_path}'" if font_path else ""
+    
+    # Envelopamento simples de linha para o título
+    words = title.split()
+    lines, curr = [], []
+    for w in words:
+        if len(" ".join(curr + [w])) > 15:
+            lines.append(" ".join(curr))
+            curr = [w]
+        else:
+            curr.append(w)
+    lines.append(" ".join(curr))
+    wrapped_title = "\n".join(lines).replace("'", "'\\''").replace(":", "\\:")
+
+    vf = (
+        f"gblur=sigma=20,"
+        f"drawbox=t=fill:color=0x002200@0.7,"
+        f"drawbox=x=60:y=60:w=iw-120:h=ih-120:color=white@0.3:t=5,"
+        f"drawtext={font_arg}:text='{wrapped_title}':fontcolor=white:fontsize=80:"
+        f"line_spacing=20:x=(w-text_w)/2:y=(h-text_h)/2"
+    )
+
+    run_command([
+        "ffmpeg", "-y", "-ss", str(middle), "-i", str(video_path),
+        "-frames:v", "1", "-vf", vf, str(output_path)
+    ], silent=True)
     return output_path.exists()
 
 def get_insta_client():

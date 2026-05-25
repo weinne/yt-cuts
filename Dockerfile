@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
     git \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Instalar gum (TUI tool)
