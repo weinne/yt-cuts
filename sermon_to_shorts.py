@@ -277,20 +277,21 @@ def generate_description(title, polished_text, video_url):
     return result.stdout.strip()
 
 def generate_thumbnail(video_path, title, output_path):
-    """Gera uma thumbnail rica com desfoque, overlay verde e título centralizado."""
+    """Gera uma thumbnail rica com desfoque, overlay verde escuro e fonte Crimson Pro."""
     duration = get_duration(video_path)
     middle = duration / 2
     
-    # Tenta localizar uma fonte válida
+    # Tenta localizar a fonte Crimson Pro ou fallback
     font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-        "/home/weinne/.local/share/fonts/c/CrimsonPro_VariableFont_wght.ttf"
+        "/home/weinne/.local/share/fonts/c/CrimsonPro_VariableFont_wght.ttf",
+        "/usr/share/fonts/truetype/crimsonpro/CrimsonPro-Bold.ttf",
+        "/app/fonts/CrimsonPro-Bold.ttf", # Caminho no Docker
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     ]
     font_path = next((p for p in font_paths if os.path.exists(p)), "")
     font_arg = f":fontfile='{font_path}'" if font_path else ""
     
-    # Envelopamento simples de linha para o título
+    # Envelopamento de linha para o título
     words = title.split()
     lines, curr = [], []
     for w in words:

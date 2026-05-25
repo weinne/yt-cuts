@@ -1,12 +1,17 @@
 FROM python:3.10-slim
 
-# Instalar dependências do sistema (FFmpeg, yt-dlp, curl para gum)
+# Instalar dependências do sistema (FFmpeg, yt-dlp, curl para gum, unzip para fontes)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
     git \
+    unzip \
     fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
+
+# Instalar fonte Crimson Pro
+RUN mkdir -p /app/fonts && \
+    curl -fsSL "https://github.com/google/fonts/raw/main/ofl/crimsonpro/CrimsonPro%5Bwght%5D.ttf" -o /app/fonts/CrimsonPro-Bold.ttf
 
 # Instalar gum (TUI tool)
 RUN mkdir -p /etc/apt/keyrings \
