@@ -25,6 +25,13 @@ except ImportError:
 
 console = Console() if TUI_AVAILABLE else None
 
+IS_TERMUX = "com.termux" in os.environ.get("PREFIX", "") or "com.termux" in os.environ.get("PATH", "")
+
+# Whisper.cpp Configuration
+WHISPER_REPO = Path.home() / "whisper.cpp-repo"
+WHISPER_BIN = WHISPER_REPO / "build/bin/whisper-cli"
+WHISPER_MODEL = WHISPER_REPO / "models/ggml-medium.bin"
+
 def run_command(command, shell=False, check=True, input_text=None, silent=True):
     if not silent:
         print(f"Executing: {' '.join(command) if isinstance(command, list) else command}")
@@ -106,7 +113,8 @@ def clean_json_response(response_text):
     return response_text.strip()
 
 def to_ms(t):
-    parts = re.split('[:.]', t)
+    # Suporta tanto . quanto , para milissegundos
+    parts = re.split('[:.,]', t)
     if len(parts) == 3: # MM:SS.mmm
         return (int(parts[0])*60 + int(parts[1]))*1000 + int(parts[2])
     elif len(parts) == 4: # HH:MM:SS.mmm
@@ -115,7 +123,7 @@ def to_ms(t):
 
 def norm_ts(ts):
     if ts.count(':') == 1: ts = "00:" + ts
-    if '.' not in ts: ts = ts + ".000"
+    if '.' not in ts and ',' not in ts: ts = ts + ".000"
     return ts
 
 def format_ts(ms):
@@ -126,6 +134,138 @@ def format_ts(ms):
     s = ms // 1000
     ms %= 1000
     return f"{h:02}:{m:02}:{s:02}.{ms:03}"
+
+def rebase_vtt_content(content, intervals):
+    """Reajusta os timestamps de um VTT/SRT baseado nos intervalos de silêncio removidos."""
+    def adjust_ts(ms, intervals):
+        new_ms = 0
+        for s, e in intervals:
+            s_ms, e_ms = int(s*1000), int(e*1000)
+            if ms < s_ms:
+                # Se o tempo está num buraco de silêncio, move para o início do próximo bloco
+                # ou fim do anterior. Aqui movemos para o início do tempo acumulado.
+                continue 
+            if ms <= e_ms:
+                return new_ms + (ms - s_ms)
+            new_ms += (e_ms - s_ms)
+        return new_ms
+
+    lines = content.splitlines()
+    new_lines = []
+    is_vtt = any("WEBVTT" in l for l in lines[:3])
+    
+    if is_vtt:
+        new_lines.append("WEBVTT")
+        new_lines.append("")
+
+    for line in lines:
+        if '-->' in line:
+            parts = line.split('-->')
+            start_str = parts[0].strip()
+            end_str = parts[1].strip()
+            
+            # Captura coordenadas extras do VTT se existirem
+            end_parts = end_str.split(' ', 1)
+            end_ts_str = end_parts[0]
+            extra = " " + end_parts[1] if len(end_parts) > 1 else ""
+            
+            start_ms = to_ms(norm_ts(start_str))
+            end_ms = to_ms(norm_ts(end_ts_str))
+            
+            new_start = adjust_ts(start_ms, intervals)
+            new_end = adjust_ts(end_ms, intervals)
+            
+            # FFmpeg subtitles filter aceita formato . mesmo em SRT, mas vamos manter o padrão
+            sep = "." if is_vtt else ","
+            ts_start = format_ts(new_start).replace(".", sep)
+            ts_end = format_ts(new_end).replace(".", sep)
+            
+            new_lines.append(f"{ts_start} --> {ts_end}{extra}")
+        elif "WEBVTT" in line:
+            continue
+        else:
+            new_lines.append(line)
+            
+    return "\n".join(new_lines)
+
+def transcribe_with_whisper(audio_path, output_vtt):
+    """Transcreve áudio usando whisper.cpp."""
+    if not WHISPER_BIN.exists():
+        print("⚠️ Whisper binary not found.")
+        return False
+        
+    wav_16k = audio_path.with_suffix(".16k.wav")
+    # Converte para 16kHz mono wav
+    run_spin_command([
+        "ffmpeg", "-y", "-i", str(audio_path), 
+        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", 
+        str(wav_16k)
+    ], title="Convertendo áudio para Whisper...")
+    
+    if not wav_16k.exists():
+        return False
+        
+    # Executa o whisper.cpp
+    cmd = [
+        str(WHISPER_BIN), 
+        "-m", str(WHISPER_MODEL), 
+        "-f", str(wav_16k), 
+        "-ovtt", 
+        "-l", "pt", 
+        "-t", "4"
+    ]
+    
+    run_spin_command(cmd, title="Whisper transcrevendo áudio...")
+    
+    # whisper-cli gera um arquivo com o nome do input + .vtt
+    vtt_gen = Path(str(wav_16k) + ".vtt")
+    if vtt_gen.exists():
+        os.rename(vtt_gen, output_vtt)
+        if wav_16k.exists(): os.remove(wav_16k)
+        return True
+    
+    return False
+
+def transcribe_segment_with_whisper(video_url, start_ts, end_ts, output_vtt, short_dir):
+    """Baixa apenas o áudio do segmento e transcreve com Whisper."""
+    segment_audio = short_dir / "segment_audio.wav"
+    high_res_video = short_dir / "high_res_segment.mp4"
+    
+    if high_res_video.exists():
+        print(f"📦 Extraindo áudio do arquivo local...")
+        run_spin_command(["ffmpeg", "-y", "-i", str(high_res_video), "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", str(segment_audio)], title="Extraindo áudio...")
+    else:
+        # Baixa apenas o pedaço do áudio usando ffmpeg + yt-dlp (rápido para segmentos curtos)
+        print(f"📥 Baixando áudio do segmento ({start_ts} - {end_ts})...")
+        cmd_dl = [
+            "yt-dlp", "-x", "--audio-format", "wav", 
+            "--external-downloader", "ffmpeg",
+            "--external-downloader-args", f"ffmpeg_i:-ss {start_ts} -to {end_ts}",
+            "-o", str(segment_audio), video_url
+        ]
+        run_spin_command(cmd_dl, title="Baixando áudio do trecho...")
+    
+    # Garantir que o nome esteja correto (yt-dlp às vezes adiciona .wav extra)
+    if not segment_audio.exists() and Path(str(segment_audio) + ".wav").exists():
+        os.rename(str(segment_audio) + ".wav", segment_audio)
+
+    if segment_audio.exists():
+        success = transcribe_with_whisper(segment_audio, output_vtt)
+        # Limpeza
+        if segment_audio.exists(): os.remove(segment_audio)
+        return success
+    return False
+
+def transcribe_with_gemini_fallback(audio_path, output_vtt):
+    """Fallback usando Gemini para transcrever o áudio (via Gemini CLI se disponível)."""
+    print("🚀 Usando Gemini como fallback para transcrição...")
+    # Para o Gemini transcrever, precisaríamos enviar o arquivo. 
+    # Atualmente a gemini-cli é usada para texto.
+    # Como alternativa, podemos extrair o texto usando yt-dlp auto-subs se ainda não tentamos,
+    # ou usar o Gemini para tentar adivinhar/corrigir se tivermos algo.
+    # Mas se chegamos aqui, é porque falhou o resto.
+    # Por enquanto, vamos retornar False e deixar o usuário saber.
+    return False
 
 def get_audio_channels_info(file_path):
     """Analisa os níveis de áudio por canal para detectar canais silenciosos."""
@@ -593,23 +733,51 @@ def stage2_render_premium(video_url, start_time, end_time, srt_path, output_path
     intervals = get_non_silent_intervals(high_res_file)
     between_expr = "+".join([f"between(t,{s:.3f},{e:.3f})" for s, e in intervals])
 
+    # Reajustar SRT para bater com o novo timeline sem silêncios
+    rebased_srt_path = srt_path
+    if srt_path.exists():
+        with open(srt_path, 'r', encoding='utf-8') as f:
+            srt_content = f.read()
+        rebased_content = rebase_vtt_content(srt_content, intervals)
+        rebased_srt_path = srt_path.with_suffix(".rebased.srt")
+        with open(rebased_srt_path, 'w', encoding='utf-8') as f:
+            f.write(rebased_content)
+
+    escaped_srt = str(rebased_srt_path).replace(":", "\\:").replace("'", "'\\''")
+    style = "FontSize=12,FontName=Verdana,Bold=1,PrimaryColour=&H00FFFFFF,Alignment=10,MarginV=10"
+
     fps_cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", str(high_res_file)]
     fps_res = run_command(fps_cmd, check=False)
     fps = fps_res.stdout.strip()
     if not fps or fps == "0/0": fps = "30"
 
-    vf = [
-        f"select='{between_expr}'",
-        "hqdn3d=1.5:1.5:3:3",
-        "crop=ih*(9/16):ih:(iw-ow)/2:0",
-        "scale=1080:1920:flags=lanczos",
-        "colorbalance=rm=-0.08:rh=-0.03",
-        "eq=gamma=1.10:contrast=1.12:brightness=-0.02:saturation=1.1",
-        "unsharp=5:5:1.0",
-        "cas=strength=0.8",
-        f"subtitles='{escaped_srt}':force_style='{style}'",
-        f"setpts=N/({fps})/TB"
-    ]
+    # Perfil de processamento adaptativo
+    if IS_TERMUX:
+        # Mobile: Foco em velocidade e bateria (Lanczos + Unsharp básico)
+        vf = [
+            f"select='{between_expr}'",
+            f"setpts=N/({fps})/TB",
+            "crop=ih*(9/16):ih:(iw-ow)/2:0",
+            "scale=1080:1920:flags=lanczos",
+            "unsharp=3:3:0.8",
+            f"subtitles='{escaped_srt}':force_style='{style}'"
+        ]
+        vcodec = ["-c:v", "libx264", "-preset", "faster", "-crf", "20"]
+    else:
+        # Desktop: Foco em qualidade máxima (Premium chain)
+        vf = [
+            f"select='{between_expr}'",
+            f"setpts=N/({fps})/TB",
+            "hqdn3d=1.5:1.5:3:3",
+            "crop=ih*(9/16):ih:(iw-ow)/2:0",
+            "scale=1080:1920:flags=lanczos",
+            "colorbalance=rm=-0.08:rh=-0.03",
+            "eq=gamma=1.10:contrast=1.12:brightness=-0.02:saturation=1.1",
+            "unsharp=5:5:1.0",
+            "cas=strength=0.8",
+            f"subtitles='{escaped_srt}':force_style='{style}'"
+        ]
+        vcodec = ["-c:v", "libx264", "-preset", "slow", "-crf", "18"]
 
     rms_stats = get_audio_channels_info(high_res_file)
     audio_fix = None
@@ -631,7 +799,7 @@ def stage2_render_premium(video_url, start_time, end_time, srt_path, output_path
         "ffmpeg", "-y", "-i", str(high_res_file),
         "-vf", ",".join(vf),
         "-af", ",".join(af),
-        "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+        *vcodec,
         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         "-c:a", "aac", "-b:a", "192k",
         str(output_path)
@@ -674,6 +842,9 @@ def main():
     if len(sys.argv) < 2:
         print("Usage: python sermon_to_shorts.py [YOUTUBE_URL]")
         return
+
+    env_name = "Termux (Mobile)" if IS_TERMUX else "Desktop (Padrão)"
+    print(f"🚀 Iniciando em ambiente: {env_name}")
 
     video_url = sys.argv[1]
     video_id = get_video_id(video_url)
@@ -868,11 +1039,16 @@ def main():
                     full_url = f"{base_url.rstrip('/')}/{rel_path}"
                     print(f"🔗 Download: {full_url}")
 
-                choice = run_gum(["gum", "choose", "--height", "12", "Preview", "Editar Legenda", "Renderizar", "Ver Descrição", "Nova Thumbnail", "Postar Instagram", "Próximo", "Voltar à Seleção", "Sair do Programa"])
+                choice = run_gum(["gum", "choose", "Preview", "Editar Legenda", "Legenda (Whisper)", "Renderizar", "Ver Descrição", "Nova Thumbnail", "Postar Instagram", "Próximo", "Voltar à Seleção", "Sair do Programa"])
                 if not choice or choice == "Voltar à Seleção": back_to_selection = True; break
                 if choice == "Sair do Programa": sys.exit(0)
                 if choice == "Preview": stage1_preview(video_url, format_ts(s_ms), format_ts(e_ms), short_dir)
                 elif choice == "Editar Legenda": subprocess.run(["micro" if subprocess.run(["which", "micro"], capture_output=True).returncode == 0 else "vim", str(edited_vtt)])
+                elif choice == "Legenda (Whisper)":
+                    if transcribe_segment_with_whisper(video_url, format_ts(s_ms), format_ts(e_ms), edited_vtt, short_dir):
+                        print("✅ Legenda recriada com Whisper (Palavra por Palavra)!")
+                    else:
+                        print("❌ Erro ao transcrever com Whisper.")
                 elif choice == "Renderizar":
                     srt = short_dir / "segment.srt"
                     run_command(["ffmpeg", "-y", "-i", str(edited_vtt), str(srt)])

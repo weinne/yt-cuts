@@ -6,7 +6,8 @@ Ferramenta automatizada para transformar sermões (ou vídeos longos) do YouTube
 
 - **Extração Inteligente:** Utiliza Gemini Pro para analisar transcrições e encontrar os momentos mais impactantes.
 - **Legendas Dinâmicas:** Gera legendas sincronizadas palavra por palavra (Word-Level Sync) com estilo personalizável.
-- **Processamento de Vídeo:** Recorte automático para o formato vertical (9:16) usando FFmpeg.
+- **Remoção de Silêncio:** Detecta e remove silêncios automaticamente para manter o vídeo dinâmico, com ajuste automático de sincronia das legendas.
+- **Processamento de Vídeo:** Recorte automático para o formato vertical (9:16) usando FFmpeg com filtros de qualidade (Unsharp, CAS, ColorBalance).
 - **IA Generativa:** 
   - Gemini Flash para polir gramática das legendas.
   - Geração automática de títulos, descrições e hashtags.
