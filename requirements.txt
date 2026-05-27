@@ -83,3 +83,5 @@ yara-python==4.5.5
 yt-dlp==2026.3.17
 yt-dlp-ejs==0.8.0
 zapzap==6.4.2
+rich
+questionary

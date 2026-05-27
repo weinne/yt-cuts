@@ -13,12 +13,6 @@ RUN apt-get update && apt-get install -y \
 RUN mkdir -p /app/fonts && \
     curl -fsSL "https://github.com/google/fonts/raw/main/ofl/crimsonpro/CrimsonPro%5Bwght%5D.ttf" -o /app/fonts/CrimsonPro-Bold.ttf
 
-# Instalar gum (TUI tool)
-RUN mkdir -p /etc/apt/keyrings \
-    && curl -fsSL https://repo.charm.sh/apt/gpg.key | gpg --dearmor -o /etc/apt/keyrings/charm.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | tee /etc/apt/list.d/charm.list \
-    && apt-get update && apt-get install -y gum
-
 # Configurar diretório de trabalho
 WORKDIR /app
 

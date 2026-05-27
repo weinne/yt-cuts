@@ -5,8 +5,25 @@ import json
 import re
 import datetime
 from pathlib import Path
-from instagrapi import Client
-from instagrapi.exceptions import TwoFactorRequired
+
+# TUI Libraries
+try:
+    from rich.console import Console
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+    from rich.live import Live
+    from rich.panel import Panel
+    import questionary
+    TUI_AVAILABLE = True
+except ImportError:
+    TUI_AVAILABLE = False
+
+try:
+    from instagrapi import Client
+    INSTA_AVAILABLE = True
+except ImportError:
+    INSTA_AVAILABLE = False
+
+console = Console() if TUI_AVAILABLE else None
 
 def run_command(command, shell=False, check=True, input_text=None, silent=True):
     if not silent:
@@ -17,71 +34,67 @@ def run_command(command, shell=False, check=True, input_text=None, silent=True):
     return result
 
 def run_spin_command(command, title="Processando...", silent=True, input_text=None):
-    """Executa um comando exibindo um spinner do gum no stderr e capturando stdout."""
-    gum_cmd = ["gum", "spin", "--spinner", "dot", "--title", title, "--"] + command
-    try:
-        # Usamos stderr=sys.stderr para que o spinner seja visível no terminal
-        # E stdout=subprocess.PIPE para capturar o resultado do comando
-        process = subprocess.Popen(gum_cmd, stdin=subprocess.PIPE if input_text else None, 
-                                 stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
-        stdout, _ = process.communicate(input=input_text)
-        
-        class Result:
-            def __init__(self, stdout, returncode):
-                self.stdout = stdout
-                self.returncode = returncode
-        
-        return Result(stdout.strip(), process.returncode)
-    except Exception as e:
-        if not silent: print(f"Erro no spinner: {e}")
+    """Executa um comando exibindo um spinner do Rich ou apenas texto se falhar."""
+    if not TUI_AVAILABLE:
+        if not silent: print(f"⌛ {title}")
         return run_command(command, input_text=input_text, silent=silent)
-
-def draw_progress_bar(percent, title="Processando"):
-    """Desenha uma barra de progresso estilo TUI no terminal."""
-    width = 40
-    filled = int(width * percent / 100)
-    bar = "█" * filled + "░" * (width - filled)
-    sys.stdout.write(f"\r  {title} |{bar}| {percent:3.1f}% ")
-    sys.stdout.flush()
+        
+    with console.status(f"[bold green]{title}[/bold green]", spinner="dots"):
+        result = subprocess.run(command, capture_output=True, text=True, input=input_text)
+        
+    class Result:
+        def __init__(self, stdout, returncode, stderr=""):
+            self.stdout = stdout
+            self.returncode = returncode
+            self.stderr = stderr
+            
+    return Result(result.stdout.strip(), result.returncode, result.stderr)
 
 def run_progress_command(command, title="Processando", total_duration=None):
-    """Executa comando e tenta extrair progresso para exibir uma barra."""
-    try:
-        if "yt-dlp" in command[0]:
-            # yt-dlp: --progress-template para garantir formato estável
-            cmd = command + ["--newline", "--progress", "--progress-template", "download:%(progress._percent_str)s"]
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in process.stdout:
-                # O template acima gera algo como "download: 10.5%"
-                if "download:" in line:
-                    m = re.search(r"(\d+(\.\d+)?)%", line)
-                    if m:
-                        draw_progress_bar(float(m.group(1)), title)
-            process.wait()
-            print()
-            return process.returncode == 0
+    """Executa comando e tenta extrair progresso para exibir uma barra do Rich."""
+    if not TUI_AVAILABLE:
+        return run_spin_command(command, title).returncode == 0
 
-        elif "ffmpeg" in command[0]:
-            # ffmpeg progress: out_time_ms é em microsegundos
-            cmd = command + ["-progress", "pipe:1", "-nostats", "-loglevel", "quiet"]
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=console
+    )
+
+    try:
+        with progress:
+            task = progress.add_task(f"[cyan]{title}", total=100)
             
-            for line in process.stdout:
-                if "out_time_ms=" in line:
-                    try:
-                        # out_time_ms=1000000 (1 segundo)
-                        time_us = int(line.split('=')[1])
-                        if total_duration and total_duration > 0:
-                            percent = min(100.0, (time_us / 1000000.0) / total_duration * 100.0)
-                            draw_progress_bar(percent, title)
-                    except: pass
-                if "progress=end" in line:
-                    draw_progress_bar(100.0, title)
-            
-            process.wait()
-            print()
-            return process.returncode == 0
-    except Exception as e:
+            if "yt-dlp" in command[0]:
+                cmd = command + ["--newline", "--progress", "--progress-template", "download:%(progress._percent_str)s"]
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in process.stdout:
+                    if "download:" in line:
+                        m = re.search(r"(\d+(\.\d+)?)%", line)
+                        if m:
+                            progress.update(task, completed=float(m.group(1)))
+                process.wait()
+                return process.returncode == 0
+
+            elif "ffmpeg" in command[0]:
+                cmd = command + ["-progress", "pipe:1", "-nostats", "-loglevel", "quiet"]
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for line in process.stdout:
+                    if "out_time_ms=" in line:
+                        try:
+                            time_us = int(line.split('=')[1])
+                            if total_duration and total_duration > 0:
+                                percent = min(100.0, (time_us / 1000000.0) / total_duration * 100.0)
+                                progress.update(task, completed=percent)
+                        except: pass
+                    if "progress=end" in line:
+                        progress.update(task, completed=100.0)
+                process.wait()
+                return process.returncode == 0
+    except Exception:
         return run_spin_command(command, title).returncode == 0
     
     return run_spin_command(command, title).returncode == 0
@@ -185,18 +198,20 @@ def get_non_silent_intervals(file_path, noise=-45, duration=0.3):
         
     non_silent = []
     last_pos = 0.0
-    buffer = 0.2
+    buffer_start = 0.1  # Pequeno buffer antes de começar a falar
+    buffer_end = 0.3    # Buffer maior após terminar de falar para não cortar palavras
     
     for s_start, s_end in silence_ranges:
-        start = max(0, last_pos - buffer)
-        end = min(total_duration, s_start + buffer)
+        # O intervalo não-silencioso é do fim do silêncio anterior até o início do próximo silêncio
+        start = max(0, last_pos - buffer_start)
+        end = min(total_duration, s_start + buffer_end)
         
         if end > start + 0.1:
             non_silent.append((start, end))
         last_pos = s_end
 
     if last_pos < total_duration:
-        start = max(0, last_pos - buffer)
+        start = max(0, last_pos - buffer_start)
         end = total_duration
         if end > start + 0.1:
             non_silent.append((start, end))
@@ -375,6 +390,9 @@ def generate_thumbnail(video_path, title, output_path):
     return output_path.exists()
 
 def get_insta_client():
+    if not INSTA_AVAILABLE:
+        print("\n❌ Instagrapi não instalado. Função de Instagram desabilitada.")
+        return None
     cl = Client()
     session_file = "insta_session.json"
 
@@ -399,7 +417,11 @@ def get_insta_client():
     cl.dump_settings(session_file)
     return cl
 
-def schedule_instagram_post(video_path, caption, thumbnail_path, schedule_time_str, collaborators=None):
+def schedule_instagram_post(*args, **kwargs):
+    if not INSTA_AVAILABLE:
+        return
+    return schedule_instagram_post_original(*args, **kwargs)
+def schedule_instagram_post_original(video_path, caption, thumbnail_path, schedule_time_str, collaborators=None):
     queue_dir = Path("insta_queue")
     queue_dir.mkdir(exist_ok=True)
 
@@ -418,27 +440,93 @@ def schedule_instagram_post(video_path, caption, thumbnail_path, schedule_time_s
     print(f"\n✅ Post agendado para {schedule_time_str}!")
 
 def get_video_id(url):
+    print(f"🔍 Identificando vídeo: {url}")
+    # Usamos run_command diretamente para evitar problemas com o gum nesta etapa
     result = run_command(["yt-dlp", "--get-id", url])
-    return result.stdout.strip()
+    if result.returncode != 0:
+        print(f"❌ Erro ao identificar vídeo: {result.stderr}")
+        return None
+    
+    # Pega apenas a última linha não vazia (o ID), ignorando avisos que possam ter saído no stdout
+    lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+    if not lines:
+        return None
+    
+    video_id = lines[-1]
+    # Validação básica do ID (geralmente 11 caracteres)
+    if len(video_id) > 20: 
+        # Se for muito longo, provavelmente algo deu errado no output
+        print(f"⚠️ Aviso: ID detectado parece inválido: {video_id[:20]}...")
+        return None
+        
+    return video_id
 
 def run_gum(command, input_text=None):
-    """Executa o gum garantindo que o TUI seja visível e interativo."""
-    import sys
-    try:
-        if "pager" in command:
-            subprocess.run(command, input=input_text, text=True, stderr=sys.stderr, stdout=sys.stdout)
+    """Substitui o gum por Questionary e Rich para maior compatibilidade."""
+    if not TUI_AVAILABLE:
+        # FALLBACK: Menu de texto simples se as bibliotecas não estiverem disponíveis
+        if "choose" in command:
+            print(f"\n--- SELEÇÃO ---")
+            options = input_text.splitlines() if input_text else [arg for arg in command if not arg.startswith("-") and arg not in ["gum", "choose"]]
+            for i, opt in enumerate(options):
+                print(f"{i+1}) {opt}")
+            try:
+                escolha = input("\nEscolha o número (ou texto): ")
+                if escolha.isdigit():
+                    idx = int(escolha) - 1
+                    return options[idx] if 0 <= idx < len(options) else ""
+                return escolha
+            except: return ""
+        elif "confirm" in command:
+            prompt = command[-1] if not command[-1].startswith("-") else "Confirmar?"
+            c = input(f"{prompt} (s/n): ").lower()
+            return "true" if c in ['s', 'y', 'sim', 'yes'] else "false"
+        elif "input" in command:
+            placeholder = ""
+            if "--placeholder" in command:
+                placeholder = command[command.index("--placeholder")+1]
+            return input(f"{placeholder}: ")
+        elif "pager" in command:
+            print(input_text)
             return ""
-        
-        if input_text:
-            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
-            stdout, _ = process.communicate(input=input_text)
-            return stdout.strip()
-        else:
-            process = subprocess.Popen(command, stdin=sys.stdin, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
-            stdout, _ = process.communicate()
-            return stdout.strip()
-    except Exception as e:
         return ""
+
+    try:
+        if "choose" in command:
+            options = input_text.splitlines() if input_text else [arg for arg in command[command.index("choose")+1:] if not arg.startswith("-")]
+            header = ""
+            if "--header" in command:
+                header = command[command.index("--header")+1]
+            
+            result = questionary.select(
+                header or "Selecione uma opção:",
+                choices=options,
+                use_indicator=True
+            ).ask()
+            return result or ""
+            
+        elif "confirm" in command:
+            prompt = command[-1] if not command[-1].startswith("-") else "Confirmar?"
+            result = questionary.confirm(prompt, default=True).ask()
+            return "true" if result else "false"
+            
+        elif "input" in command:
+            placeholder = ""
+            if "--placeholder" in command:
+                placeholder = command[command.index("--placeholder")+1]
+            result = questionary.text(placeholder or "Digite:").ask()
+            return result or ""
+            
+        elif "pager" in command:
+            console.print(Panel(input_text or "", title="Visualizador", border_style="blue"))
+            questionary.press_any_key_to_continue().ask()
+            return ""
+            
+    except Exception:
+        return ""
+        
+    return ""
+
 
 def stage1_preview(video_url, start_time, end_time, short_dir):
     """ETAPA 1: Módulo de Preview Dinâmico no Terminal"""
@@ -467,7 +555,7 @@ def stage1_preview(video_url, start_time, end_time, short_dir):
     run_spin_command([
         "ffmpeg", "-y", "-i", str(preview_file),
         "-vf", "crop=ih*(9/16):ih:(iw-ow)/2:0,scale=w=-2:h=480",
-        "-c:v", "libx264", "-preset", "ultrafast", str(test_clip)
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(test_clip)
     ], title="Processando preview...")
 
     try:
@@ -531,15 +619,20 @@ def stage2_render_premium(video_url, start_time, end_time, srt_path, output_path
         if abs(c1 - c2) > 10:
             audio_fix = "pan=stereo|c0=c0+c1|c1=c0+c1" if c1 > c2 else "pan=stereo|c0=c1+c0|c1=c1+c0"
 
-    af = [f"aselect='{between_expr}'", "asetpts=PTS-STARTPTS"]
+    af = [f"aselect='{between_expr}'", "asetpts=N/SR/TB"]
     if audio_fix: af.append(audio_fix)
-    af.extend(["acompressor=threshold=-12dB:ratio=4:attack=5:release=50", "loudnorm=I=-16:TP=-1.5:LRA=11"])
+    af.extend([
+        "afade=t=in:st=0:d=0.05", # Fade in no início total
+        "acompressor=threshold=-12dB:ratio=4:attack=5:release=50", 
+        "loudnorm=I=-16:TP=-1.5:LRA=11"
+    ])
 
     cmd = [
         "ffmpeg", "-y", "-i", str(high_res_file),
         "-vf", ",".join(vf),
         "-af", ",".join(af),
         "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         "-c:a", "aac", "-b:a", "192k",
         str(output_path)
     ]
@@ -584,7 +677,9 @@ def main():
 
     video_url = sys.argv[1]
     video_id = get_video_id(video_url)
-    if not video_id: return
+    if not video_id:
+        print("❌ Não foi possível identificar o vídeo. Verifique sua conexão ou a URL.")
+        return
 
     project_dir = Path(f"outputs/{video_id}")
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -594,6 +689,7 @@ def main():
     analysis_json = project_dir / "analysis.json"
 
     if not vtt_file.exists():
+        print("DEBUG: transcript not found, starting download")
         run_progress_command([
             "yt-dlp", "--write-auto-subs", "--write-subs", 
             "--sub-langs", "pt.*,en.*", "--sub-format", "vtt", 
