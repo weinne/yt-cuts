@@ -27,6 +27,36 @@ console = Console() if TUI_AVAILABLE else None
 
 IS_TERMUX = "com.termux" in os.environ.get("PREFIX", "") or "com.termux" in os.environ.get("PATH", "")
 
+def get_ytdlp_command(args):
+    """Retorna o comando yt-dlp com flags de bypass, cookies e simulação de navegador."""
+    base = ["yt-dlp"]
+    
+    # Adiciona cookies se arquivo existir
+    cookies_file = os.getenv("YT_COOKIES_PATH", "cookies.txt")
+    if os.path.exists(cookies_file):
+        base.extend(["--cookies", cookies_file])
+    
+    # Runtime JS para evitar avisos e melhorar extração
+    base.extend(["--js-runtimes", "node"])
+    
+    # Simulação de Navegador e Anonimato (Modo Incógnito)
+    # Nota: --impersonate chrome foi removido pois causa erro de dependência no Termux
+    base.extend([
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "--referer", "https://www.google.com/",
+        "--add-header", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "--add-header", "Accept-Language:pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "--no-check-certificates",
+        "--no-cache-dir",
+        "--geo-bypass"
+    ])
+    
+    # Remove "yt-dlp" do início dos args se estiver lá
+    if args and args[0] == "yt-dlp":
+        args = args[1:]
+        
+    return base + args
+
 # Whisper.cpp Configuration
 WHISPER_REPO = Path.home() / "whisper.cpp-repo"
 WHISPER_BIN = WHISPER_REPO / "build/bin/whisper-cli"
@@ -237,12 +267,12 @@ def transcribe_segment_with_whisper(video_url, start_ts, end_ts, output_vtt, sho
     else:
         # Baixa apenas o pedaço do áudio usando ffmpeg + yt-dlp (rápido para segmentos curtos)
         print(f"📥 Baixando áudio do segmento ({start_ts} - {end_ts})...")
-        cmd_dl = [
-            "yt-dlp", "-x", "--audio-format", "wav", 
+        cmd_dl = get_ytdlp_command([
+            "-x", "--audio-format", "wav", 
             "--external-downloader", "ffmpeg",
             "--external-downloader-args", f"ffmpeg_i:-ss {start_ts} -to {end_ts}",
             "-o", str(segment_audio), video_url
-        ]
+        ])
         run_spin_command(cmd_dl, title="Baixando áudio do trecho...")
     
     # Garantir que o nome esteja correto (yt-dlp às vezes adiciona .wav extra)
@@ -495,13 +525,17 @@ def generate_thumbnail(video_path, title, output_path):
     
     # Tenta localizar a fonte Crimson Pro ou fallback
     font_paths = [
+        str(Path.home() / ".fonts/CrimsonPro/CrimsonPro-Variable.ttf"),
+        "/data/data/com.termux/files/usr/share/fonts/CrimsonPro/CrimsonPro-Variable.ttf",
         "/home/weinne/.local/share/fonts/c/CrimsonPro_VariableFont_wght.ttf",
         "/usr/share/fonts/truetype/crimsonpro/CrimsonPro-Bold.ttf",
         "/app/fonts/CrimsonPro-Bold.ttf", # Caminho no Docker
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     ]
     font_path = next((p for p in font_paths if os.path.exists(p)), "")
-    font_arg = f":fontfile='{font_path}'" if font_path else ""
+    
+    # Escapa caracteres especiais para o FFmpeg
+    escaped_font_path = font_path.replace(":", "\\:").replace("'", "'\\''")
     
     # Envelopamento de linha para o título
     words = title.split()
@@ -515,12 +549,23 @@ def generate_thumbnail(video_path, title, output_path):
     lines.append(" ".join(curr))
     wrapped_title = "\n".join(lines).replace("'", "'\\''").replace(":", "\\:")
 
+    # Filtros para o drawtext
+    drawtext_options = [
+        f"text='{wrapped_title}'",
+        "fontcolor=white",
+        "fontsize=80",
+        "line_spacing=20",
+        "x=(w-text_w)/2",
+        "y=(h-text_h)/2"
+    ]
+    if font_path:
+        drawtext_options.insert(0, f"fontfile='{escaped_font_path}'")
+
     vf = (
         f"gblur=sigma=20,"
         f"drawbox=t=fill:color=0x002200@0.7,"
         f"drawbox=x=60:y=60:w=iw-120:h=ih-120:color=white@0.3:t=5,"
-        f"drawtext={font_arg}:text='{wrapped_title}':fontcolor=white:fontsize=80:"
-        f"line_spacing=20:x=(w-text_w)/2:y=(h-text_h)/2"
+        f"drawtext={':'.join(drawtext_options)}"
     )
 
     run_command([
@@ -582,7 +627,7 @@ def schedule_instagram_post_original(video_path, caption, thumbnail_path, schedu
 def get_video_id(url):
     print(f"🔍 Identificando vídeo: {url}")
     # Usamos run_command diretamente para evitar problemas com o gum nesta etapa
-    result = run_command(["yt-dlp", "--get-id", url])
+    result = run_command(get_ytdlp_command(["--get-id", url]))
     if result.returncode != 0:
         print(f"❌ Erro ao identificar vídeo: {result.stderr}")
         return None
@@ -682,11 +727,11 @@ def stage1_preview(video_url, start_time, end_time, short_dir):
     preview_end_ts = format_ts(s_ms + preview_dur_ms)
 
     # Download preview section with progress
-    run_progress_command([
-        "yt-dlp", "-f", "worstvideo[height<=240][fps<=15]+worstaudio/worst",
+    run_progress_command(get_ytdlp_command([
+        "-f", "worstvideo[height<=240][fps<=15]+worstaudio/worst",
         "--download-sections", f"*{start_time}-{preview_end_ts}",
         "-o", str(preview_file), video_url
-    ], title="Baixando trecho preview")
+    ]), title="Baixando trecho preview")
 
     if not preview_file.exists():
         return False
@@ -718,11 +763,11 @@ def stage2_render_premium(video_url, start_time, end_time, srt_path, output_path
     duration_secs = (to_ms(norm_ts(end_time)) - to_ms(norm_ts(start_time))) / 1000
 
     if not high_res_file.exists():
-        run_progress_command([
-            "yt-dlp", "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/mp4",
+        run_progress_command(get_ytdlp_command([
+            "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/mp4",
             "--download-sections", f"*{start_time}-{end_time}",
             "-o", str(high_res_file), video_url
-        ], title="Baixando alta resolução")
+        ]), title="Baixando alta resolução")
 
     if not high_res_file.exists():
         return False
@@ -753,13 +798,16 @@ def stage2_render_premium(video_url, start_time, end_time, srt_path, output_path
 
     # Perfil de processamento adaptativo
     if IS_TERMUX:
-        # Mobile: Foco em velocidade e bateria (Lanczos + Unsharp básico)
+        # Mobile: Software encoding (libx264) é mais estável no Termux que MediaCodec
         vf = [
             f"select='{between_expr}'",
             f"setpts=N/({fps})/TB",
+            "hqdn3d=1.0:1.0:3:3",
             "crop=ih*(9/16):ih:(iw-ow)/2:0",
             "scale=1080:1920:flags=lanczos",
-            "unsharp=3:3:0.8",
+            "colorbalance=rm=-0.05:rh=-0.02",
+            "unsharp=5:5:0.8",
+            "cas=strength=0.5",
             f"subtitles='{escaped_srt}':force_style='{style}'"
         ]
         vcodec = ["-c:v", "libx264", "-preset", "faster", "-crf", "20"]
@@ -796,7 +844,7 @@ def stage2_render_premium(video_url, start_time, end_time, srt_path, output_path
     ])
 
     cmd = [
-        "ffmpeg", "-y", "-i", str(high_res_file),
+        "ffmpeg", "-y", "-threads", "0", "-i", str(high_res_file),
         "-vf", ",".join(vf),
         "-af", ",".join(af),
         *vcodec,
@@ -839,14 +887,37 @@ def start_file_server(port=None, directory="outputs"):
 def main():
     # Inicia o servidor de arquivos no background
     server_port = start_file_server()
+    
+    video_url = None
     if len(sys.argv) < 2:
-        print("Usage: python sermon_to_shorts.py [YOUTUBE_URL]")
-        return
+        # Tenta listar vídeos já analisados
+        outputs_dir = Path("outputs")
+        if outputs_dir.exists():
+            projects = []
+            for d in outputs_dir.iterdir():
+                if d.is_dir() and (d / "transcript.vtt").exists():
+                    # Tenta descobrir o título (por enquanto o ID)
+                    projects.append(d.name)
+            
+            if projects:
+                print("\n📂 Vídeos já analisados encontrados:")
+                choice = run_gum(["gum", "choose", "--header", "Selecione um vídeo para continuar ou Sair", "Sair"] + projects)
+                if not choice or choice == "Sair":
+                    return
+                # Reconstrói a URL a partir do ID (assumindo YouTube)
+                video_url = f"https://www.youtube.com/watch?v={choice}"
+            else:
+                print("Usage: python sermon_to_shorts.py [YOUTUBE_URL]")
+                return
+        else:
+            print("Usage: python sermon_to_shorts.py [YOUTUBE_URL]")
+            return
+    else:
+        video_url = sys.argv[1]
 
     env_name = "Termux (Mobile)" if IS_TERMUX else "Desktop (Padrão)"
     print(f"🚀 Iniciando em ambiente: {env_name}")
 
-    video_url = sys.argv[1]
     video_id = get_video_id(video_url)
     if not video_id:
         print("❌ Não foi possível identificar o vídeo. Verifique sua conexão ou a URL.")
@@ -861,11 +932,11 @@ def main():
 
     if not vtt_file.exists():
         print("DEBUG: transcript not found, starting download")
-        run_progress_command([
-            "yt-dlp", "--write-auto-subs", "--write-subs", 
+        run_progress_command(get_ytdlp_command([
+            "--write-auto-subs", "--write-subs", 
             "--sub-langs", "pt.*,en.*", "--sub-format", "vtt", 
             "--skip-download", "-o", str(project_dir / "transcript"), video_url
-        ], title="Buscando legendas")
+        ]), title="Buscando legendas")
         
         found_vtt = None
         for suffix in [".pt.vtt", ".pt-orig.vtt", ".en.vtt", ".vtt"]:

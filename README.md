@@ -54,6 +54,25 @@ O script irá:
 3. Permitir que você edite legendas, gere o vídeo e a descrição.
 4. Oferecer a opção de **Agendar no Instagram**.
 
+## 🛠️ Solução de Problemas (Troubleshooting)
+
+### Erro 429 ou Detecção de Bot no YouTube
+Se você encontrar erros como "Too Many Requests" ou "Sign in to confirm you’re not a bot", siga estes passos:
+
+1. **Use Cookies:**
+   - Instale a extensão [Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/ccmclabimipitempgejnadgljebadhia) no seu navegador desktop.
+   - Acesse o YouTube, faça login e exporte os cookies para um arquivo chamado `cookies.txt`.
+   - Coloque o arquivo `cookies.txt` na pasta raiz deste projeto.
+   - O script detectará automaticamente o arquivo e o usará em todas as requisições ao YouTube.
+
+2. **JavaScript Runtime:**
+   - O `yt-dlp` funciona melhor com um runtime JavaScript. No Termux ou Linux, instale o Node.js:
+     ```bash
+     pkg install nodejs-lts  # No Termux
+     # ou
+     sudo apt install nodejs # No Ubuntu/Debian
+     ```
+
 ### 2. Agendamento no Instagram
 Ao escolher a opção de agendar, o post será salvo na pasta `insta_queue/`.
 
